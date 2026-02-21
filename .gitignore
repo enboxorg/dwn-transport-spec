@@ -1,3 +1,6 @@
 .cache
 node_modules
 spec/index.html
+
+# Local AI agent instructions (not committed)
+CLAUDE.local.md
