@@ -1,0 +1,16 @@
+{
+  "specs": [
+    {
+      "title": "DWN Transport Protocol",
+      "spec_directory": "./spec",
+      "output_path": "./spec",
+      "logo": "images/logo.svg",
+      "logo_link": "https://enbox.org",
+      "source": {
+        "host": "github",
+        "account": "enboxorg",
+        "repo": "dwn-transport-spec"
+      }
+    }
+  ]
+}

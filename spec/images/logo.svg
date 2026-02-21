@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120" width="400" height="120">
+  <defs>
+    <linearGradient id="boxGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#1D4ED8"/>
+    </linearGradient>
+    <linearGradient id="boxFace" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#60A5FA"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <linearGradient id="boxSide" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2563EB"/>
+      <stop offset="100%" stop-color="#1E40AF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 3D Box Icon -->
+  <g transform="translate(20, 15)">
+    <!-- Box top face -->
+    <polygon points="45,10 85,30 45,50 5,30" fill="url(#boxFace)" opacity="0.95"/>
+    <!-- Box left face -->
+    <polygon points="5,30 45,50 45,85 5,65" fill="url(#boxGrad)" opacity="0.9"/>
+    <!-- Box right face -->
+    <polygon points="85,30 45,50 45,85 85,65" fill="url(#boxSide)" opacity="0.85"/>
+    <!-- Highlight edge -->
+    <line x1="45" y1="50" x2="45" y2="85" stroke="#93C5FD" stroke-width="0.5" opacity="0.6"/>
+    <!-- Top edge highlights -->
+    <line x1="5" y1="30" x2="45" y2="10" stroke="#BFDBFE" stroke-width="0.5" opacity="0.4"/>
+    <line x1="45" y1="10" x2="85" y2="30" stroke="#BFDBFE" stroke-width="0.5" opacity="0.4"/>
+  </g>
+
+  <!-- "enbox" text -->
+  <text x="125" y="76" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="56" font-weight="700" letter-spacing="-1" fill="#1E293B">
+    en<tspan fill="url(#boxGrad)">box</tspan>
+  </text>
+
+  <!-- Subtle tagline -->
+  <text x="127" y="100" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" letter-spacing="3" fill="#64748B">
+    DECENTRALIZED WEB NODE
+  </text>
+</svg>
