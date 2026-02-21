@@ -26,9 +26,17 @@ jobs:
       - name: Build spec
         run: npm run render
 
+      - name: Create Cloudflare Pages project (if needed)
+        uses: cloudflare/wrangler-action@v3
+        continue-on-error: true
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages project create dwn-transport-spec --production-branch=main
+
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy ./spec --project-name=dwn-transport-spec
+          command: pages deploy ./spec --project-name=dwn-transport-spec --commit-dirty=true
