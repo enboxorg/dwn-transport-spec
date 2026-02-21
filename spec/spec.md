@@ -77,6 +77,21 @@ that wraps a DWN message for transport over HTTP or WebSocket.
 [[def:Subscription]]
 ~ A long-lived connection over WebSocket where the server pushes real-time events
 to the client in response to a `RecordsSubscribe` or `MessagesSubscribe` message.
+Events are delivered as `SubscriptionMessage` objects — a discriminated union of
+event payloads (with cursors) and End-of-Stored-Events (EOSE) markers. See
+[Subscription Events](#ws-subscription-events).
+
+[[def:SubscriptionMessage]]
+~ A discriminated union delivered over a [[ref:Subscription]]. Each message has a
+`type` field: `"event"` for a regular event carrying a cursor and payload, or
+`"eose"` for an End-of-Stored-Events marker signaling that catch-up replay is
+complete.
+
+[[def:Cursor]]
+~ An opaque string assigned by the server's EventLog implementation to each event.
+Clients persist cursors and pass them back when reconnecting to resume from the
+last seen position. Cursor format is implementation-defined and ****MUST NOT**** be
+parsed or constructed by clients.
 
 ## Service Endpoint Discovery {#service-endpoint-discovery}
 
@@ -279,7 +294,9 @@ pushing matching events to the client.
 
 - `reply` — The DWN subscribe reply. If successful, subsequent events are pushed
   as individual JSON-RPC responses with the subscription `id` as the response `id`
-  and `result.event` containing the event payload.
+  and `result.subscription` containing a [[ref:SubscriptionMessage]] — either an
+  event payload with a [[ref:Cursor]], or an EOSE marker. See
+  [Subscription Events](#ws-subscription-events).
 
 #### `rpc.subscribe.close` {#method-subscribe-close}
 
@@ -526,28 +543,119 @@ request with a `subscription` object containing a client-assigned `id`:
 The server processes the subscribe message on the DWN. If successful, the server
 returns a success response and begins pushing events for the subscription.
 
-#### Receiving Events {#ws-events}
+To resume a subscription after a disconnect (cursor mode), the client includes a
+`cursor` field in the descriptor with a [[ref:Cursor]] value obtained from a prior
+subscription event:
 
-Subsequent events are pushed as JSON-RPC response objects where:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-1",
+  "method": "rpc.subscribe.dwn.processMessage",
+  "params": {
+    "target": "did:example:alice",
+    "message": {
+      "descriptor": {
+        "interface": "Records",
+        "method": "Subscribe",
+        "filter": { "protocol": "https://social.example/protocol" },
+        "cursor": "<opaque-cursor-string>"
+      },
+      "authorization": { ... }
+    }
+  },
+  "subscription": { "id": "sub-2" }
+}
+```
+
+In cursor mode, the server replays stored events after the cursor, sends an
+[EOSE marker](#ws-eose), then continues with live events.
+
+#### Subscription Events {#ws-subscription-events}
+
+After a successful subscribe response, the server pushes
+[[ref:SubscriptionMessage]] objects as JSON-RPC responses where:
 
 - `id` is the **subscription** `id` (not the original request `id`).
-- `result.event` contains the event payload.
+- `result.subscription` contains a [[ref:SubscriptionMessage]] — a discriminated
+  union with a `type` field of `"event"` or `"eose"`.
+
+##### Event Messages {#ws-event-messages}
+
+An event message carries the DWN event payload and an opaque [[ref:Cursor]]
+string identifying the event's position in the EventLog.
 
 ```json
 {
   "jsonrpc": "2.0",
   "id": "sub-1",
   "result": {
-    "event": {
-      "message": { ... },
-      "initialWrite": { ... }
+    "subscription": {
+      "type": "event",
+      "cursor": "<opaque-cursor-string>",
+      "event": {
+        "message": { ... },
+        "initialWrite": { ... }
+      }
     }
   }
 }
 ```
 
+| Field | Type | Description |
+|---|---|---|
+| `type` | `"event"` | Discriminator for an event message |
+| `cursor` | `string` | Opaque EventLog cursor. Clients ****SHOULD**** persist this value for reconnection. |
+| `event` | `object` | The event payload containing `message` (the DWN message) and optionally `initialWrite` (the initial `RecordsWrite` for update/delete events). |
+
+##### EOSE (End-of-Stored-Events) {#ws-eose}
+
+When a subscription is created with a `cursor` (cursor mode), the server replays
+all stored events after that cursor position. After replay is complete, the server
+sends an EOSE marker to signal that all subsequent messages are live events.
+
+Subscriptions created without a cursor (snapshot mode) never receive EOSE.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "sub-1",
+  "result": {
+    "subscription": {
+      "type": "eose",
+      "cursor": "<opaque-cursor-string>"
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | `"eose"` | Discriminator for the End-of-Stored-Events marker |
+| `cursor` | `string` | Opaque cursor of the last replayed stored event. If no stored events matched (i.e. the subscriber was already caught up), this echoes the input cursor. |
+
+##### Subscription Modes {#ws-subscription-modes}
+
+Subscriptions operate in one of two modes depending on the DWN subscribe message:
+
+- **Snapshot mode** (no `cursor` in the subscribe descriptor): The DWN returns an
+  initial set of matching records in the subscribe reply's `entries` field, then
+  delivers only live events through the subscription. No EOSE is sent.
+
+- **Cursor mode** (`cursor` present in the subscribe descriptor): The DWN replays
+  stored events from the EventLog starting after the cursor, sends an EOSE marker,
+  then continues with live events. No `entries` are returned in the subscribe reply.
+
+Cursor mode enables clients to reconnect after a disconnect without missing events.
+See the [DWN specification](https://github.com/enboxorg/dwn-spec) for full details
+on subscription modes and EventLog semantics.
+
+##### Deduplication {#ws-deduplication}
+
 Clients ****SHOULD**** deduplicate events by `messageCid`, as the DWN specification
-notes that duplicate events may be received.
+notes that duplicate events may be received. This is especially relevant during the
+catch-up → live transition in cursor mode, where the EventLog implementation buffers
+live events during replay.
 
 #### Closing a Subscription {#ws-close-subscription}
 
