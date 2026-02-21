@@ -259,6 +259,7 @@ Error codes in the `-32xxx` range are standard JSON-RPC errors. Codes in the
 | `dwn.processMessage` | HTTP, WebSocket | Process any DWN message |
 | `rpc.subscribe.dwn.processMessage` | WebSocket only | Open a subscription for a DWN subscribe message |
 | `rpc.subscribe.close` | WebSocket only | Close an active subscription |
+| `rpc.ack` | WebSocket only | Acknowledge receipt of subscription events (flow control) |
 
 #### `dwn.processMessage` {#method-process-message}
 
@@ -605,7 +606,7 @@ string identifying the event's position in the EventLog.
 | Field | Type | Description |
 |---|---|---|
 | `type` | `"event"` | Discriminator for an event message |
-| `cursor` | `string` | Opaque EventLog cursor. Clients ****SHOULD**** persist this value for reconnection. |
+| `cursor` | `string` | Opaque EventLog cursor. Used for [flow control](#ws-flow-control) acknowledgment and for reconnection. Clients ****SHOULD**** persist this value. |
 | `event` | `object` | The event payload containing `message` (the DWN message) and optionally `initialWrite` (the initial `RecordsWrite` for update/delete events). |
 
 ##### EOSE (End-of-Stored-Events) {#ws-eose}
@@ -673,6 +674,79 @@ To close a subscription, the client sends a `rpc.subscribe.close` request:
 The server ****MUST**** stop sending events for the closed subscription and release
 associated resources. All active subscriptions ****MUST**** be automatically closed
 when the WebSocket connection is closed.
+
+#### Flow Control (Backpressure) {#ws-flow-control}
+
+To prevent a fast-producing server from overwhelming a slow-consuming client,
+the WebSocket transport implements a **sliding window** flow control mechanism
+using the `rpc.ack` method.
+
+##### Server Behavior
+
+The server maintains a per-subscription window of **unacknowledged events**. The
+maximum window size is configured by the server and advertised as `maxInFlight`
+in the [ServerInfo](#server-info-object) response.
+
+- When the server has an event to deliver, it checks the window:
+  - If the number of unacknowledged events is **less than** `maxInFlight`, the
+    event is sent immediately.
+  - If the window is **full**, the event is buffered.
+- When the server receives an `rpc.ack` for a subscription, it acknowledges all
+  events up to and including the specified cursor (cumulative acknowledgment) and
+  flushes buffered events into the freed window slots.
+- If the buffer exceeds a server-defined maximum (****RECOMMENDED**** 1000), the
+  server ****MUST**** close the subscription to prevent unbounded memory growth.
+
+::: note
+Both `"event"` and `"eose"` messages count toward the `maxInFlight` window.
+Clients ****MUST**** acknowledge EOSE messages the same way as event messages.
+:::
+
+##### `rpc.ack` Method {#method-rpc-ack}
+
+The client sends `rpc.ack` to acknowledge receipt and processing of subscription
+events. This is a JSON-RPC **notification** (no `id` field is required, and no
+response is expected on success).
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "rpc.ack",
+  "params": { "cursor": "abc123" },
+  "subscription": { "id": "sub-1" }
+}
+```
+
+**Parameters:**
+
+- `cursor` — The cursor from the most recently processed [[ref:SubscriptionMessage]].
+  ****MUST**** be a non-empty string.
+
+**Subscription:**
+
+- `id` — The identifier of the subscription being acknowledged.
+
+**Behavior:**
+
+- The acknowledgment is **cumulative**: acking cursor X acknowledges all events
+  with cursors up to and including X.
+- Clients ****SHOULD**** send `rpc.ack` after processing each event or batch of events.
+- If the cursor is unknown (e.g., stale or duplicate), the server ****SHOULD****
+  ignore the acknowledgment silently.
+
+##### Client Implementation
+
+Clients ****MUST**** send `rpc.ack` after processing each subscription message to
+advance the server's flow-control window. A client that does not send acknowledgments
+will stop receiving events once the server's window fills up, and will eventually
+have its subscription closed if the buffer overflows.
+
+A ****RECOMMENDED**** client implementation sends `rpc.ack` immediately after the
+subscription message handler returns:
+
+```
+receive SubscriptionMessage → invoke handler → send rpc.ack(cursor)
+```
 
 ### Heartbeat {#ws-heartbeat}
 
@@ -865,6 +939,7 @@ GET /info
   "url": "https://dwn.example.com",
   "webSocketSupport": true,
   "maxFileSize": 1073741824,
+  "maxInFlight": 32,
   "registrationRequirements": ["proof-of-work-sha256-v0", "terms-of-service"]
 }
 ```
@@ -879,6 +954,7 @@ GET /info
 | `url` | `string` | Yes | The canonical base URL of the server |
 | `webSocketSupport` | `boolean` | Yes | Whether the server supports WebSocket connections |
 | `maxFileSize` | `number` | Yes | Maximum data size in bytes for a single `RecordsWrite` |
+| `maxInFlight` | `number` | No | Maximum number of unacknowledged subscription events per subscription before the server pauses delivery. Defaults to `32` if not present. See [Flow Control](#ws-flow-control). |
 | `registrationRequirements` | `string[]` | Yes | List of registration requirements (empty array if open) |
 
 #### Registration Requirement Values {#registration-requirement-values}
@@ -1169,6 +1245,8 @@ The `dwn-request` header value ****SHOULD NOT**** exceed 8 KB. Implementations
 - Servers ****MUST**** close WebSocket connections that fail heartbeat checks.
 - Servers ****SHOULD**** set a maximum WebSocket message frame size and reject
   oversized frames.
+- Servers ****MUST**** enforce the [flow control](#ws-flow-control) buffer limit
+  to prevent unbounded memory growth from unacknowledged subscriptions.
 
 ### Header Injection {#header-injection}
 
