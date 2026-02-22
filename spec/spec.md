@@ -940,9 +940,21 @@ GET /info
   "webSocketSupport": true,
   "maxFileSize": 1073741824,
   "maxInFlight": 32,
-  "registrationRequirements": ["proof-of-work-sha256-v0", "terms-of-service"]
+  "registrationRequirements": ["proof-of-work-sha256-v0", "terms-of-service"],
+  "providerAuth": {
+    "authorizeUrl": "https://provider.example.com/authorize",
+    "tokenUrl": "https://provider.example.com/token",
+    "refreshUrl": "https://provider.example.com/refresh",
+    "managementUrl": "https://provider.example.com/account"
+  }
 }
 ```
+
+::: note
+The `providerAuth` object is only present when `provider-auth-v0` is included in
+`registrationRequirements`. Clients ****MUST NOT**** assume its presence unless the
+registration requirement is advertised.
+:::
 
 #### ServerInfo Object {#server-info-object}
 
@@ -956,6 +968,11 @@ GET /info
 | `maxFileSize` | `number` | Yes | Maximum data size in bytes for a single `RecordsWrite` |
 | `maxInFlight` | `number` | No | Maximum number of unacknowledged subscription events per subscription before the server pauses delivery. Defaults to `32` if not present. See [Flow Control](#ws-flow-control). |
 | `registrationRequirements` | `string[]` | Yes | List of registration requirements (empty array if open) |
+| `providerAuth` | `object` | Conditional | Provider auth configuration. ****MUST**** be present when `provider-auth-v0` is listed in `registrationRequirements`. |
+| `providerAuth.authorizeUrl` | `string` | Yes | URL to redirect the user for authentication, signup, or payment. ****MAY**** be on the DWN server domain or an external domain. |
+| `providerAuth.tokenUrl` | `string` | Yes | URL where the client exchanges an authorization code for a registration token. |
+| `providerAuth.refreshUrl` | `string` | No | URL to refresh an expired registration token. If absent, tokens do not support refresh. |
+| `providerAuth.managementUrl` | `string` | No | URL for user-facing account management. If absent, no management UI is available. |
 
 #### Registration Requirement Values {#registration-requirement-values}
 
@@ -963,6 +980,7 @@ GET /info
 |---|---|
 | `proof-of-work-sha256-v0` | Client must complete a SHA-256 proof-of-work challenge |
 | `terms-of-service` | Client must accept the server's terms of service |
+| `provider-auth-v0` | The server requires authentication with the DWN provider's auth service. When present, the `providerAuth` object ****MUST**** be included in the Server Information response. |
 
 ### Health Endpoint {#health-endpoint}
 
@@ -978,7 +996,8 @@ GET /health
 
 Multi-tenant [[ref:DWN Servers]] ****MAY**** require tenant registration before accepting
 DWN messages for a given DID. Registration prevents abuse by requiring proof of
-computational work and/or acceptance of terms of service.
+computational work, acceptance of terms of service, and/or authentication with the
+DWN provider's auth service.
 
 A server that requires registration ****MUST**** advertise its requirements in the
 [ServerInfo](#server-info-object) `registrationRequirements` array. A server with
@@ -989,8 +1008,10 @@ an empty `registrationRequirements` array is open and does not require registrat
 1. The client fetches the [ServerInfo](#info-endpoint) to discover registration requirements.
 2. If `proof-of-work-sha256-v0` is required, the client fetches a proof-of-work challenge.
 3. If `terms-of-service` is required, the client fetches the terms of service text.
-4. The client computes the proof-of-work response and/or terms-of-service hash.
-5. The client submits the registration request.
+4. If `provider-auth-v0` is required, the client initiates the
+   [Provider Authentication](#provider-auth-registration) flow.
+5. The client computes the proof-of-work response and/or terms-of-service hash.
+6. The client submits the registration request.
 
 ### Proof-of-Work Challenge {#pow-challenge}
 
@@ -1037,6 +1058,139 @@ GET /registration/terms-of-service
 The client computes a SHA-256 hash of the terms text (hex-encoded) to include in
 the registration request, indicating acceptance.
 
+### Provider Authentication Registration {#provider-auth-registration}
+
+When `provider-auth-v0` is listed in `registrationRequirements`, the server supports
+an OAuth2-inspired authentication flow where the DWN provider authenticates and
+authorizes the user through its own auth service. This enables paid DWN service
+providers to onboard tenants via login, payment, or plan selection flows.
+
+#### Flow Overview {#provider-auth-flow}
+
+1. The client fetches [ServerInfo](#info-endpoint) and discovers `provider-auth-v0`
+   in `registrationRequirements`, along with the `providerAuth` configuration object.
+2. The client constructs the authorize URL by appending query parameters to
+   `providerAuth.authorizeUrl`:
+   - `redirect_uri` — Where the provider redirects after authentication. ****MUST****
+     be an HTTPS URL (for browser-based wallets) or a native deep link / universal
+     link (for mobile apps).
+   - `state` — A CSRF protection nonce. ****MUST**** be cryptographically random.
+   - `client_id` — ****MAY**** be included as a client or wallet identifier.
+3. The client opens the authorize URL (via browser redirect, WebView, or system browser).
+4. The user authenticates with the provider. The authentication experience is
+   provider-defined and ****MAY**** include login, account creation, payment, or
+   plan selection.
+5. On success, the provider redirects back to `redirect_uri` with query parameters:
+   - `code` — An authorization code.
+   - `state` — The same `state` value from step 2.
+
+   On failure, the provider redirects back with:
+   - `error` — An error code.
+   - `error_description` — A human-readable error message.
+   - `state` — The same `state` value from step 2.
+
+6. The client validates that the returned `state` matches the value sent in step 2.
+   If the values do not match, the client ****MUST**** abort the flow.
+7. The client exchanges the authorization code for a registration token via
+   `POST {providerAuth.tokenUrl}`.
+8. The client registers DIDs via `POST /registration` using the registration token.
+
+#### Token Exchange Endpoint {#provider-auth-token-exchange}
+
+```
+POST {providerAuth.tokenUrl}
+Content-Type: application/json
+```
+
+**Request Body:**
+
+```json
+{
+  "grantType": "authorization_code",
+  "code": "<authorization_code>",
+  "redirectUri": "<redirect_uri_from_step_2>"
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `grantType` | Yes | ****MUST**** be `"authorization_code"`. |
+| `code` | Yes | The authorization code received from the provider redirect. |
+| `redirectUri` | Yes | The `redirect_uri` used in the authorize request. ****MUST**** match exactly. |
+
+**Response Body:**
+
+```json
+{
+  "registrationToken": "<opaque_token>",
+  "refreshToken": "<optional_refresh_token>",
+  "expiresIn": 3600,
+  "tokenType": "bearer"
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `registrationToken` | Yes | An opaque token used in subsequent `POST /registration` requests. |
+| `refreshToken` | No | A token that ****MAY**** be used to obtain a new registration token after expiration. Only present if `providerAuth.refreshUrl` is advertised. |
+| `expiresIn` | Yes | Token lifetime in seconds. |
+| `tokenType` | Yes | ****MUST**** be `"bearer"`. |
+
+**Error Response:**
+
+- **400:** `{ "error": "<error_code>", "errorDescription": "<message>" }` — The
+  authorization code is invalid, expired, or the `redirectUri` does not match.
+
+#### Token Refresh Endpoint {#provider-auth-token-refresh}
+
+If the server advertises `providerAuth.refreshUrl`, the client ****MAY**** refresh
+an expired registration token.
+
+```
+POST {providerAuth.refreshUrl}
+Content-Type: application/json
+```
+
+**Request Body:**
+
+```json
+{
+  "grantType": "refresh_token",
+  "refreshToken": "<refresh_token>"
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `grantType` | Yes | ****MUST**** be `"refresh_token"`. |
+| `refreshToken` | Yes | The refresh token from a previous token exchange or refresh response. |
+
+**Response Body:** Same shape as the [Token Exchange](#provider-auth-token-exchange) response.
+
+**Error Response:**
+
+- **400:** `{ "error": "<error_code>", "errorDescription": "<message>" }` — The
+  refresh token is invalid or expired.
+
+#### Design Notes {#provider-auth-design-notes}
+
+- **Opaque tokens:** Registration tokens are intentionally opaque to the client.
+  The server ****MAY**** implement them as JWTs, blind RSA tokens, ecash tokens,
+  or any other format. Clients ****MUST NOT**** parse or interpret the token contents.
+
+- **Privacy preservation:** Nothing in this protocol requires the provider to
+  correlate DIDs with user accounts. A privacy-preserving provider ****MAY**** issue
+  blinded tokens that cannot be linked back to the authentication session.
+
+- **Reusable tokens:** A single registration token ****MAY**** be used to register
+  multiple DIDs, subject to provider-defined limits. The server ****SHOULD****
+  document any per-token DID registration limits in its terms of service.
+
+- **Browser and native support:** The `redirect_uri` parameter supports both HTTPS
+  URLs (for browser-based wallets) and native deep links or universal links (for
+  mobile and desktop apps). Clients ****SHOULD**** use platform-appropriate redirect
+  mechanisms (e.g., custom URL schemes on mobile, loopback URLs for desktop apps).
+
 ### Registration Submission {#registration-submission}
 
 ```
@@ -1055,6 +1209,9 @@ Content-Type: application/json
   "proofOfWork": {
     "challengeNonce": "a1b2c3d4e5f6...",
     "responseNonce": "x7y8z9..."
+  },
+  "providerAuth": {
+    "registrationToken": "..."
   }
 }
 ```
@@ -1062,14 +1219,22 @@ Content-Type: application/json
 | Field | Required | Description |
 |---|---|---|
 | `registrationData.did` | Yes | The DID to register as a tenant |
-| `registrationData.termsOfServiceHash` | Conditional | SHA-256 hex hash of the ToS text. Required if `terms-of-service` is in the registration requirements. |
-| `proofOfWork.challengeNonce` | Conditional | The challenge nonce from the server. Required if `proof-of-work-sha256-v0` is in the registration requirements. |
-| `proofOfWork.responseNonce` | Conditional | The client's solution nonce. Required if `proof-of-work-sha256-v0` is in the registration requirements. |
+| `registrationData.termsOfServiceHash` | Conditional | SHA-256 hex hash of the ToS text. Required if `terms-of-service` is in the registration requirements. ****MAY**** be omitted when using `provider-auth-v0` if the provider handles ToS acceptance in the auth flow. |
+| `proofOfWork` | Conditional | Proof-of-work solution. Required if `proof-of-work-sha256-v0` is in the registration requirements. |
+| `proofOfWork.challengeNonce` | Conditional | The challenge nonce from the server. |
+| `proofOfWork.responseNonce` | Conditional | The client's solution nonce. |
+| `providerAuth` | Conditional | Provider authentication credentials. Required if `provider-auth-v0` is in the registration requirements. |
+| `providerAuth.registrationToken` | Conditional | The registration token obtained from the [Token Exchange](#provider-auth-token-exchange) endpoint. |
+
+A registration request ****MUST**** include `proofOfWork`, `providerAuth`, or both,
+depending on the server's `registrationRequirements`. If the server lists both
+`proof-of-work-sha256-v0` and `provider-auth-v0`, the client ****MUST**** satisfy
+both requirements unless the server explicitly documents that either is sufficient.
 
 **Response:**
 - **200:** `{ "success": true }` — Registration succeeded.
 - **400:** `{ "code": "...", "message": "..." }` — Validation failure (invalid
-  proof-of-work, wrong terms hash, expired challenge, etc.).
+  proof-of-work, wrong terms hash, expired challenge, invalid registration token, etc.).
 
 
 ## Sync Orchestration {#sync-orchestration}
