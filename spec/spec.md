@@ -115,10 +115,19 @@ The service entry ****MUST**** conform to the following requirements:
 
 - The `id` property ****MUST**** have a fragment value of `#dwn`.
 - The `type` property ****MUST**** be `"DecentralizedWebNode"`.
-- The `serviceEndpoint` property ****MUST**** be either:
+- The `serviceEndpoint` property ****MUST**** be one of:
   - A `string` value containing a single HTTPS URL.
-  - An `array` of `string` values, each containing an HTTPS URL. Multiple
-    endpoints indicate replicated nodes that synchronize to the same state.
+  - A map (JSON object) with a `url` property containing an HTTPS URL, and optional properties described below.
+  - An `array` of `string` values and/or maps as described above. Multiple endpoints indicate nodes that synchronize to the same state.
+
+When a `serviceEndpoint` entry is a map, the following properties are defined:
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `url` | `string` | Yes | The HTTPS URL of the DWN endpoint. |
+| `dataRetention` | `string` | No | `"cache"` when the node operates as a best-effort relay/cache. |
+
+When `dataRetention` is absent, or when the entry is a bare `string`, the endpoint is a full node. A bare string `"https://dwn.example.com"` is equivalent to `{ "url": "https://dwn.example.com" }`.
 
 ::: example DID Document with DWN Service Entry
 ```json
@@ -129,7 +138,7 @@ The service entry ****MUST**** conform to the following requirements:
     "type": "DecentralizedWebNode",
     "serviceEndpoint": [
       "https://dwn.example.com",
-      "https://dwn-backup.example.com"
+      { "url": "https://relay.example.com", "dataRetention": "cache" }
     ]
   }]
 }
@@ -146,9 +155,16 @@ The service entry ****MUST**** conform to the following requirements:
 ### Multi-Endpoint Resolution {#multi-endpoint-resolution}
 
 When a DID document contains multiple [[ref:Service Endpoint]] URLs, a [[ref:DWN Client]]
-****SHOULD**** treat them as equivalent replicas. The client ****MAY**** select any
-endpoint for a given request. Clients ****SHOULD**** implement failover by attempting
-alternative endpoints when a request fails.
+****SHOULD**** implement failover by attempting alternative endpoints when a request fails.
+
+Endpoints with no `dataRetention` property (including bare string entries) are full nodes and
+****SHOULD**** be treated as equivalent replicas. The client ****MAY**** select any full
+endpoint for a given request.
+
+Endpoints with `"dataRetention": "cache"` are best-effort relays. A client ****MAY**** send
+write operations to any endpoint (including cache endpoints). For read operations, clients
+****SHOULD**** prefer full endpoints when available, as cache endpoints may not retain all
+record data.
 
 For write operations (`RecordsWrite`, `RecordsDelete`, `ProtocolsConfigure`), a client
 ****SHOULD**** send the message to at least one endpoint. The sync protocol ensures
@@ -1000,6 +1016,7 @@ payment without registration, or neither.
 | `providerAuth.tokenUrl` | `string` | Yes | URL where the client exchanges an authorization code for a registration token. |
 | `providerAuth.refreshUrl` | `string` | No | URL to refresh an expired registration token. If absent, tokens do not support refresh. |
 | `providerAuth.managementUrl` | `string` | No | URL for user-facing account management. If absent, no management UI is available. |
+| `dataRetention` | `string` | No | `"full"` (default if absent) or `"cache"`. Indicates whether the server retains all record data or operates as a best-effort relay/cache. Corresponds to the `dataRetention` property in the DWN service endpoint entry. |
 | `payment` | `object` | No | Payment capabilities. ****MUST**** be present when the server supports [Per-Message Payment](#per-message-payment). |
 | `payment.methods` | `string[]` | Yes | Payment flow methods supported. See [Payment Methods](#payment-methods). |
 | `payment.schemes` | `string[]` | Yes | [[ref:Payment Scheme]] URN identifiers supported. See [Payment Scheme Registry](#payment-scheme-registry). |
