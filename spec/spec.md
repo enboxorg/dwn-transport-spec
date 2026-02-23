@@ -1923,6 +1923,54 @@ responses.
 - The `dwn-payment` header ****SHOULD NOT**** exceed 8 KB. Implementations ****MAY****
   reject requests with excessively large payment headers.
 
+### Transport-Layer Privacy {#transport-privacy}
+
+::: note
+DWN messages carried over HTTPS or WebSocket are protected by TLS, which encrypts
+the wire content from network observers. However, TLS alone does not conceal all
+metadata. The target DWN's service endpoint URL is visible in DNS lookups and TLS
+SNI, the sender's IP address is visible to the server, and request timing and
+sizes are observable by network intermediaries. When record-level encryption is
+used (as defined in the [DWN specification](https://github.com/enboxorg/dwn-spec)),
+the record data is additionally protected at rest — but the transport metadata
+remains exposed.
+
+For deployments that require stronger transport-layer privacy, implementations
+****MAY**** wrap DWN JSON-RPC payloads inside a [DIDComm v2](https://identity.foundation/didcomm-messaging/spec/v2.1/)
+encrypted message envelope before transmission. DIDComm's routing protocol
+enables onion-style multi-hop delivery through mediators, where each intermediary
+sees only the next hop and an opaque encrypted payload — no single party along
+the route learns both the original sender and the final recipient. The DIDComm
+envelope is stripped upon delivery to the target DWN server, and the inner DWN
+message is then processed through the standard authorization and handling pipeline.
+
+This layering is strictly additive: the DIDComm envelope provides ephemeral,
+transit-scoped privacy (protecting the journey), while DWN's own authorization
+model, CID-based signatures, and record-level encryption provide persistent,
+data-scoped security (protecting the destination). The two layers serve
+fundamentally different purposes and ****MUST NOT**** be conflated:
+
+- **DIDComm envelopes are disposable.** They use per-message ECDH key agreement
+  (ECDH-1PU for authenticated encryption, or ECDH-ES for anonymous encryption)
+  to protect a single message in transit. Once delivered, the envelope is
+  discarded. DIDComm signatures (when used) wrap the full message body, making
+  them unsuitable for content-addressed storage where data and metadata are
+  stored and verified independently.
+
+- **DWN authorization is persistent.** DWN messages sign a CID of the descriptor
+  — a content-addressed commitment that remains verifiable regardless of how the
+  message was transported or re-serialized. DWN's multi-layered authorization
+  (owner, delegate, permission grant, protocol rules) and hierarchical key
+  derivation for encryption are designed for long-lived data, not ephemeral
+  communication.
+
+Implementations that adopt DIDComm as a transport envelope ****MUST**** ensure that
+DWN message authentication and authorization are performed on the unwrapped DWN
+message, not on any properties of the DIDComm envelope. The DIDComm layer
+provides no authorization guarantees that are meaningful to the DWN processing
+pipeline.
+:::
+
 ## Normative References
 
 [[spec]]
