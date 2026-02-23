@@ -33,6 +33,7 @@ Specifically, this specification covers:
 - **REST convenience API** for simple, unauthenticated resource access
 - **Server information and capability discovery**
 - **Tenant registration** for multi-tenant DWN servers
+- **Per-message payment** for usage-based DWN server monetization
 - **Sync orchestration** between DWN nodes
 
 ## Status of This Document
@@ -92,6 +93,15 @@ complete.
 Clients persist cursors and pass them back when reconnecting to resume from the
 last seen position. Cursor format is implementation-defined and ****MUST NOT**** be
 parsed or constructed by clients.
+
+[[def:Payment Scheme]]
+~ A named protocol for fulfilling a payment obligation. Each scheme defines its own
+`PaymentRequirements` extensions and `PaymentProof` format. Scheme identifiers use
+URN format (`urn:enbox:payment:<scheme>:<version>`) for global uniqueness.
+
+[[def:Payment Handler]]
+~ A client-side component that can detect a supported [[ref:Payment Scheme]] in a
+`PaymentRequirements` object and produce a corresponding `PaymentProof`.
 
 ## Service Endpoint Discovery {#service-endpoint-discovery}
 
@@ -246,6 +256,7 @@ Implementations ****MUST**** use the following error codes:
 | `-32300` | Transport Error | Transport-level failure (e.g., stream interrupted) |
 | `-50400` | Bad Request | The DWN message was malformed or failed validation |
 | `-50401` | Unauthorized | Authentication or authorization failed |
+| `-50402` | Payment Required | The server requires payment to process this message. See [Per-Message Payment](#per-message-payment). |
 | `-50403` | Forbidden | The operation is not permitted for the given tenant |
 | `-50409` | Conflict | The message conflicts with existing state (e.g., duplicate) |
 
@@ -449,15 +460,15 @@ Servers ****MUST**** include the following CORS headers on every HTTP response:
 | `Access-Control-Allow-Origin` | `*` |
 | `Access-Control-Allow-Methods` | `GET, POST, OPTIONS` |
 | `Access-Control-Allow-Headers` | `*` |
-| `Access-Control-Expose-Headers` | `dwn-response` |
+| `Access-Control-Expose-Headers` | `dwn-response, dwn-payment` |
 
 Servers ****MUST**** respond to `OPTIONS` preflight requests with HTTP `204 No Content`
 and the above headers.
 
 ::: note
-The `dwn-response` header must be listed in `Access-Control-Expose-Headers` to ensure
-browser-based clients can read it. Without this, the header is opaque to JavaScript
-running in a browser context.
+The `dwn-response` and `dwn-payment` headers must be listed in
+`Access-Control-Expose-Headers` to ensure browser-based clients can read them.
+Without this, the headers are opaque to JavaScript running in a browser context.
 :::
 
 ### Method Restrictions {#http-method-restrictions}
@@ -946,6 +957,15 @@ GET /info
     "tokenUrl": "https://provider.example.com/token",
     "refreshUrl": "https://provider.example.com/refresh",
     "managementUrl": "https://provider.example.com/account"
+  },
+  "payment": {
+    "methods": ["per-message-payment-v0"],
+    "schemes": [
+      "urn:enbox:payment:l402:v0",
+      "urn:enbox:payment:cashu:v0"
+    ],
+    "currency": "sat",
+    "infoUrl": "https://provider.example.com/pricing"
   }
 }
 ```
@@ -954,6 +974,13 @@ GET /info
 The `providerAuth` object is only present when `provider-auth-v0` is included in
 `registrationRequirements`. Clients ****MUST NOT**** assume its presence unless the
 registration requirement is advertised.
+:::
+
+::: note
+The `payment` object is only present when the server supports per-message payment.
+Clients ****MUST NOT**** assume its presence. Payment is orthogonal to registration —
+a server ****MAY**** require registration AND support per-message payment, or support
+payment without registration, or neither.
 :::
 
 #### ServerInfo Object {#server-info-object}
@@ -973,6 +1000,11 @@ registration requirement is advertised.
 | `providerAuth.tokenUrl` | `string` | Yes | URL where the client exchanges an authorization code for a registration token. |
 | `providerAuth.refreshUrl` | `string` | No | URL to refresh an expired registration token. If absent, tokens do not support refresh. |
 | `providerAuth.managementUrl` | `string` | No | URL for user-facing account management. If absent, no management UI is available. |
+| `payment` | `object` | No | Payment capabilities. ****MUST**** be present when the server supports [Per-Message Payment](#per-message-payment). |
+| `payment.methods` | `string[]` | Yes | Payment flow methods supported. See [Payment Methods](#payment-methods). |
+| `payment.schemes` | `string[]` | Yes | [[ref:Payment Scheme]] URN identifiers supported. See [Payment Scheme Registry](#payment-scheme-registry). |
+| `payment.currency` | `string` | Yes | Base currency unit for pricing (e.g., `"sat"`, `"usd-cents"`). |
+| `payment.infoUrl` | `string` | No | URL to a human-readable pricing page. |
 
 #### Registration Requirement Values {#registration-requirement-values}
 
@@ -1237,6 +1269,461 @@ both requirements unless the server explicitly documents that either is sufficie
   proof-of-work, wrong terms hash, expired challenge, invalid registration token, etc.).
 
 
+## Per-Message Payment {#per-message-payment}
+
+A [[ref:DWN Server]] ****MAY**** require payment for processing individual DWN messages.
+This enables usage-based monetization where providers charge per operation — for
+writes, reads, queries, or any combination thereof — using the payment method(s) of
+their choice.
+
+Per-message payment is ****OPTIONAL**** for both servers and clients. Servers that do
+not enable payment never return `-50402` errors and behave identically to servers
+without payment support. Clients that do not implement payment handling still work
+against free servers and receive typed errors from paid servers that they can surface
+to users or handle at the application layer.
+
+Per-message payment is orthogonal to [Tenant Registration](#tenant-registration).
+A server ****MAY**** require registration, support per-message payment, both, or neither.
+
+### Payment Flow {#payment-flow}
+
+The per-message payment flow uses a challenge/response pattern within the existing
+JSON-RPC transport:
+
+```
+Client                              DWN Server
+  │                                      │
+  │  POST / (dwn-request header)         │
+  │─────────────────────────────────────>│
+  │                                      │  Server evaluates pricing policy:
+  │                                      │  this message requires payment
+  │  JSON-RPC error response             │
+  │  code: -50402 (Payment Required)     │
+  │  data: { paymentId,                  │
+  │          paymentRequirements: [...] } │
+  │<─────────────────────────────────────│
+  │                                      │
+  │  Client selects a payment scheme     │
+  │  Client fulfills the payment         │
+  │                                      │
+  │  POST / (dwn-request header          │
+  │        + dwn-payment header)         │
+  │─────────────────────────────────────>│
+  │                                      │  Server verifies payment proof
+  │                                      │  Server processes DWN message
+  │                                      │  Server settles payment
+  │  JSON-RPC success response           │
+  │<─────────────────────────────────────│
+```
+
+1. The client sends a normal `dwn.processMessage` request.
+2. The server evaluates its pricing policy. If the message requires payment and no
+   valid payment proof is attached, the server returns a JSON-RPC error with code
+   `-50402` and a `data` field containing `PaymentRequiredData`.
+3. The client inspects the `paymentRequirements` array, selects a
+   [[ref:Payment Scheme]] it supports, and fulfills the payment using its
+   [[ref:Payment Handler]] for that scheme.
+4. The client retries the **same** request with the original `dwn-request` header
+   and an additional `dwn-payment` header containing the `PaymentProof`.
+5. The server verifies the payment proof, processes the DWN message, settles the
+   payment, and returns the normal JSON-RPC response.
+
+If the message does not require payment (e.g., the pricing policy assigns a zero
+price, or the server does not have payment enabled), the server ****MUST**** process
+the message immediately without returning `-50402`.
+
+### The `-50402` Error Response {#payment-required-error}
+
+When a server requires payment for a message, it ****MUST**** return a JSON-RPC
+error response with code `-50402`. The `data` field ****MUST**** contain a
+`PaymentRequiredData` object:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "abc-123",
+  "error": {
+    "code": -50402,
+    "message": "Payment required",
+    "data": {
+      "paymentId": "pay_7f3a8b2c-1d4e-5f6a-9b8c-7d6e5f4a3b2c",
+      "paymentRequirements": [
+        {
+          "scheme": "urn:enbox:payment:l402:v0",
+          "amount": "100",
+          "description": "RecordsWrite (1.2 MB)",
+          "invoice": "lnbc1000n1pj9...",
+          "macaroon": "0201036c6e6402..."
+        },
+        {
+          "scheme": "urn:enbox:payment:cashu:v0",
+          "amount": "100",
+          "description": "RecordsWrite (1.2 MB)",
+          "mints": ["https://mint.example.com"],
+          "unit": "sat"
+        }
+      ]
+    }
+  }
+}
+```
+
+Like all DWN-level errors, the `-50402` response is returned inside a JSON-RPC
+envelope over an HTTP `200` response. The HTTP status code reflects transport-level
+success; the JSON-RPC error code reflects the payment requirement.
+
+#### `PaymentRequiredData` Object {#payment-required-data}
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `paymentId` | `string` | Yes | A server-generated identifier for this payment challenge. The client ****MUST**** include this value in the `PaymentProof` when retrying. Servers ****SHOULD**** use a UUID v4 or similarly unique value. |
+| `paymentRequirements` | `PaymentRequirements[]` | Yes | An array of one or more payment options. Each entry describes one [[ref:Payment Scheme]] the server accepts for this message. |
+
+#### `PaymentRequirements` Object {#payment-requirements-object}
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `scheme` | `string` | Yes | The [[ref:Payment Scheme]] URN identifier (e.g., `"urn:enbox:payment:l402:v0"`). |
+| `amount` | `string` | Yes | The price in the server's base currency unit (as advertised in `ServerInfo.payment.currency`). String to avoid floating-point precision issues. |
+| `description` | `string` | No | A human-readable description of the charge (e.g., `"RecordsWrite (1.2 MB)"`). |
+
+Each [[ref:Payment Scheme]] extends `PaymentRequirements` with additional
+scheme-specific fields. See [Payment Scheme Registry](#payment-scheme-registry)
+for the fields defined by each registered scheme.
+
+### The `dwn-payment` Header {#dwn-payment-header}
+
+When retrying a request after receiving a `-50402` error, the client ****MUST****
+include a `dwn-payment` HTTP header containing a JSON-serialized `PaymentProof`
+object.
+
+The `dwn-payment` header is ****OPTIONAL****. If a server does not require payment
+for a given message, the header is ignored if present. If a server requires payment
+and the header is absent, the server returns `-50402`.
+
+::: example RecordsWrite with Payment Proof
+```http
+POST / HTTP/1.1
+Host: dwn.example.com
+Content-Type: application/octet-stream
+dwn-request: {"jsonrpc":"2.0","id":"abc-123","method":"dwn.processMessage","params":{"target":"did:example:alice","message":{...}}}
+dwn-payment: {"paymentId":"pay_7f3a8b2c-1d4e-5f6a-9b8c-7d6e5f4a3b2c","scheme":"urn:enbox:payment:l402:v0","macaroon":"0201036c6e6402...","preimage":"79852a07912..."}
+
+<binary record data>
+```
+:::
+
+#### `PaymentProof` Object {#payment-proof-object}
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `paymentId` | `string` | Yes | The `paymentId` from the `PaymentRequiredData` that prompted this payment. |
+| `scheme` | `string` | Yes | The [[ref:Payment Scheme]] URN identifier. ****MUST**** match one of the schemes offered in the `paymentRequirements`. |
+
+Each [[ref:Payment Scheme]] extends `PaymentProof` with additional scheme-specific
+fields containing the proof of payment. See [Payment Scheme Registry](#payment-scheme-registry).
+
+### Server Behavior {#payment-server-behavior}
+
+#### Pricing Policy {#pricing-policy}
+
+The server ****MUST**** evaluate a pricing policy to determine whether a message
+requires payment and how much it costs. The pricing policy is server-defined and
+****MAY**** consider any combination of:
+
+- The DWN interface and method (`Records`/`Write`, `Records`/`Query`, etc.)
+- The data size (for `RecordsWrite`)
+- The protocol URI
+- The target tenant
+- The message author
+
+If the evaluated price is zero, the server ****MUST**** process the message without
+requiring payment, even if payment is enabled.
+
+#### Payment Verification {#payment-verification}
+
+When a `dwn-payment` header is present, the server ****MUST****:
+
+1. Parse and validate the `PaymentProof` JSON.
+2. Verify that the `paymentId` matches a recently issued payment challenge.
+3. Dispatch to the [[ref:Payment Scheme]] adapter matching `proof.scheme`.
+4. Verify the proof according to the scheme's rules (e.g., macaroon signature
+   verification for L402, proof redemption check for Cashu, signature verification
+   for x402).
+5. If verification fails, the server ****MUST**** return a `-50402` error with
+   fresh `paymentRequirements`.
+
+#### Payment Settlement {#payment-settlement}
+
+After the DWN message is successfully processed, the server ****SHOULD**** settle
+the payment (e.g., broadcast an on-chain transaction for x402, or mark the payment
+as complete for L402/Cashu). Settlement is scheme-specific and ****MAY**** be
+asynchronous.
+
+If settlement fails after the message has been processed, the server ****SHOULD****
+log the failure for manual reconciliation. The server ****MUST NOT**** reverse the
+DWN message processing — the message is committed regardless of settlement outcome.
+
+#### Idempotency {#payment-idempotency}
+
+The server ****MUST**** ensure that a given `paymentId` can only be used once. If
+a client retries with the same `paymentId` after a successful payment, the server
+****MUST**** return the original response without charging again.
+
+Servers ****SHOULD**** expire unused `paymentId` values after a reasonable timeout
+(****RECOMMENDED**** 5 minutes).
+
+### Client Behavior {#payment-client-behavior}
+
+#### Detection {#payment-detection}
+
+Clients ****MUST**** check for error code `-50402` in JSON-RPC error responses.
+When detected:
+
+1. Parse the `error.data` field as a `PaymentRequiredData` object.
+2. Iterate the `paymentRequirements` array.
+3. For each entry, check whether a registered [[ref:Payment Handler]] supports
+   the `scheme`.
+4. If a handler is found, invoke it to produce a `PaymentProof`.
+5. Retry the original request with the `dwn-payment` header.
+
+Clients ****MUST NOT**** retry more than once per `-50402` response to prevent
+infinite payment loops. If the retry also returns `-50402`, the client ****MUST****
+surface the error to the application layer.
+
+#### No Handler Available {#payment-no-handler}
+
+If the client does not have a [[ref:Payment Handler]] for any of the offered
+schemes, the client ****SHOULD**** surface the `PaymentRequiredData` to the
+application layer. This allows applications to present payment options to the user
+or handle the error appropriately.
+
+Clients ****MUST NOT**** silently drop `-50402` errors. The error ****MUST**** be
+propagated to the caller.
+
+#### Feature Detection {#payment-feature-detection}
+
+Clients ****MAY**** inspect the `payment` field in [ServerInfo](#server-info-object)
+to determine payment capabilities before sending messages. This allows clients to:
+
+- Discover which [[ref:Payment Scheme]]s a server accepts.
+- Display pricing information to users.
+- Pre-select a DWN provider based on cost.
+
+Clients ****MUST**** check `payment.methods` to determine the payment flow model.
+If the client does not recognize any of the listed methods, it ****SHOULD NOT****
+attempt to handle `-50402` errors from that server.
+
+### Payment Methods {#payment-methods}
+
+The `payment.methods` array in [ServerInfo](#server-info-object) declares which
+payment flow models the server supports. This is the primary feature detection
+signal for clients.
+
+| Value | Description |
+|---|---|
+| `per-message-payment-v0` | Per-message challenge/response as defined in this section. The server returns `-50402` on individual messages that require payment. |
+
+::: note
+Future specifications may define additional methods such as `prepaid-balance-v0`
+(deposit credits, deduct per message) or `subscription-v0` (recurring payment for
+a quota). Methods are orthogonal to each other and to
+[registration requirements](#registration-requirement-values).
+:::
+
+### Payment Scheme Registry {#payment-scheme-registry}
+
+[[ref:Payment Scheme]] identifiers ****MUST**** use the URN format
+`urn:enbox:payment:<scheme-name>:<version>` to ensure global uniqueness and prevent
+collisions between independently developed schemes.
+
+Third parties ****MAY**** define their own schemes using their own URN namespace
+(e.g., `urn:example:payment:stripe:v0`). Servers and clients negotiate scheme
+support through the `paymentRequirements` array — no central registry is required
+for interoperability.
+
+The following schemes are defined by this specification:
+
+#### `urn:enbox:payment:l402:v0` — Lightning L402 {#scheme-l402}
+
+L402 combines [macaroons](https://research.google/pubs/macaroons-cookies-with-contextual-caveats-for-decentralized-authorization-in-the-cloud/)
+(bearer authentication tokens with embedded caveats) and Lightning Network invoices.
+The client pays a Lightning invoice to obtain a preimage, then presents the macaroon
+and preimage together as proof of payment.
+
+**Additional `PaymentRequirements` fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `invoice` | `string` | Yes | A BOLT-11 Lightning invoice for the required amount. |
+| `macaroon` | `string` | Yes | A hex-encoded macaroon with the invoice's payment hash as a caveat. |
+
+**Additional `PaymentProof` fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `macaroon` | `string` | Yes | The macaroon from the payment requirements (hex-encoded). |
+| `preimage` | `string` | Yes | The Lightning payment preimage obtained by paying the invoice (hex-encoded). |
+
+**Verification:** The server verifies the macaroon signature chain using its root
+key, validates all caveats (amount, expiry, etc.), and confirms that
+`SHA-256(preimage) == payment_hash` from the macaroon's payment hash caveat.
+
+**Settlement:** Settlement is atomic with payment. The Lightning payment transfers
+value when the client obtains the preimage. No additional settlement step is required.
+
+::: example L402 Payment Requirements
+```json
+{
+  "scheme": "urn:enbox:payment:l402:v0",
+  "amount": "100",
+  "description": "RecordsQuery",
+  "invoice": "lnbc1000n1pj9nwz2pp5xt7...",
+  "macaroon": "0201036c6e640204..."
+}
+```
+:::
+
+::: example L402 Payment Proof
+```json
+{
+  "paymentId": "pay_7f3a8b2c-1d4e-5f6a-9b8c-7d6e5f4a3b2c",
+  "scheme": "urn:enbox:payment:l402:v0",
+  "macaroon": "0201036c6e640204...",
+  "preimage": "79852a0791225dee00be0a6cf31a1619782c21d35995e118bfc74ad812174035"
+}
+```
+:::
+
+#### `urn:enbox:payment:cashu:v0` — Cashu Ecash {#scheme-cashu}
+
+[Cashu](https://cashu.space) ecash tokens are bearer instruments — cryptographic
+proofs of value issued by a mint. The client sends ecash proofs that the server
+redeems with the mint. Cashu provides instant settlement, privacy (blind-signed
+tokens are unlinkable to the payer), and support for very small amounts.
+
+**Additional `PaymentRequirements` fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `mints` | `string[]` | Yes | Accepted mint URLs. The client ****MUST**** provide proofs from one of these mints. |
+| `unit` | `string` | No | The Cashu unit (e.g., `"sat"`). Defaults to the server's `payment.currency`. |
+
+**Additional `PaymentProof` fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `tokens` | `string` | Yes | A Cashu token string (`cashuA...` or `cashuB...` encoded) containing proofs totaling at least the required amount. |
+
+**Verification:** The server decodes the Cashu token, verifies the mint URL is in
+the accepted list, checks proof state with the mint (unspent), and verifies the
+total proof amount meets or exceeds the required amount.
+
+**Settlement:** The server redeems the proofs with the mint (swap or receive). This
+is instant and atomic — once redeemed, the value is transferred.
+
+::: example Cashu Payment Requirements
+```json
+{
+  "scheme": "urn:enbox:payment:cashu:v0",
+  "amount": "100",
+  "description": "RecordsWrite (1.2 MB)",
+  "mints": ["https://mint.example.com"],
+  "unit": "sat"
+}
+```
+:::
+
+::: example Cashu Payment Proof
+```json
+{
+  "paymentId": "pay_7f3a8b2c-1d4e-5f6a-9b8c-7d6e5f4a3b2c",
+  "scheme": "urn:enbox:payment:cashu:v0",
+  "tokens": "cashuAeyJ0b2tlbiI6W3sicH..."
+}
+```
+:::
+
+#### `urn:enbox:payment:x402-exact:v0` — x402 Exact (EVM/SVM) {#scheme-x402}
+
+[x402](https://github.com/coinbase/x402) uses signed on-chain token transfer
+authorizations. The client signs an EIP-3009 `transferWithAuthorization` (EVM) or
+equivalent authorization (SVM) that a facilitator service broadcasts and settles
+on-chain.
+
+**Additional `PaymentRequirements` fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `network` | `string` | Yes | Chain identifier (e.g., `"eip155:8453"` for Base, `"solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"` for Solana mainnet). |
+| `asset` | `string` | Yes | Token contract address (EVM) or mint address (SVM). |
+| `payTo` | `string` | Yes | The provider's receiving address. |
+| `maxTimeoutSeconds` | `number` | No | Maximum time the server will wait for settlement. Defaults to `60`. |
+| `extra` | `object` | No | Additional chain-specific metadata (e.g., `{ "name": "USDC", "version": "2" }` for EIP-712 domain). |
+
+**Additional `PaymentProof` fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `payload` | `string` | Yes | Base64-encoded x402 `PaymentPayload` containing the signed authorization. |
+
+**Verification:** The server forwards the payload to an x402 facilitator's
+`/verify` endpoint, or verifies the EIP-712 signature locally.
+
+**Settlement:** The server forwards the payload to the facilitator's `/settle`
+endpoint. The facilitator broadcasts the on-chain transaction and returns the
+transaction hash.
+
+::: note
+The x402 scheme requires an external facilitator service for settlement. The
+facilitator broadcasts the transaction and pays gas fees. See the
+[x402 specification](https://github.com/coinbase/x402) for facilitator API details.
+:::
+
+::: example x402 Payment Requirements
+```json
+{
+  "scheme": "urn:enbox:payment:x402-exact:v0",
+  "amount": "10000",
+  "description": "RecordsWrite (1.2 MB)",
+  "network": "eip155:8453",
+  "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "payTo": "0x1234567890abcdef1234567890abcdef12345678",
+  "maxTimeoutSeconds": 60,
+  "extra": { "name": "USDC", "version": "2" }
+}
+```
+:::
+
+### Design Notes {#payment-design-notes}
+
+- **Transport-layer concern:** Per-message payment is a transport/server concern,
+  not a DWN protocol concern. The DWN specification and the DWN SDK do not need
+  to be aware of payment. Payment requirements and proofs are exchanged via HTTP
+  headers and JSON-RPC error codes, outside the DWN message envelope.
+
+- **Multiple schemes simultaneously:** A server ****MAY**** offer multiple payment
+  schemes in a single `paymentRequirements` array. The client selects the first
+  scheme it supports. This allows providers to accept both Lightning and Cashu (or
+  any combination) without requiring clients to support all methods.
+
+- **Payment is optional on both sides:** Servers that don't enable payment never
+  return `-50402`. Clients that don't implement payment handlers work against free
+  servers and receive typed errors from paid servers. Neither side breaks when the
+  other doesn't support payment.
+
+- **Pricing granularity:** The pricing policy is server-defined and not specified
+  in this document. A server ****MAY**** charge flat per-message rates, per-byte
+  rates for writes, different rates for different interfaces, or implement dynamic
+  pricing. The `PaymentRequirements.amount` reflects the evaluated price for the
+  specific message that triggered the `-50402`.
+
+- **Data-bearing retries:** When a `RecordsWrite` with data receives a `-50402`,
+  the client ****MUST**** resend both the `dwn-request` header and the request
+  body (binary data) on retry, along with the `dwn-payment` header. The server
+  ****MUST NOT**** cache request bodies across the challenge/response boundary.
+
+
 ## Sync Orchestration {#sync-orchestration}
 
 The DWN specification defines the `MessagesSync` interface and the Sparse Merkle Tree
@@ -1415,9 +1902,26 @@ The `dwn-request` header value ****SHOULD NOT**** exceed 8 KB. Implementations
 
 ### Header Injection {#header-injection}
 
-The `dwn-request` and `dwn-response` headers carry JSON payloads. Implementations
-****MUST**** validate that these values are well-formed JSON before processing.
-Implementations ****MUST NOT**** reflect unsanitized header values in responses.
+The `dwn-request`, `dwn-response`, and `dwn-payment` headers carry JSON payloads.
+Implementations ****MUST**** validate that these values are well-formed JSON before
+processing. Implementations ****MUST NOT**** reflect unsanitized header values in
+responses.
+
+### Payment Security {#payment-security}
+
+- Servers ****MUST**** expire `paymentId` values after a bounded timeout to prevent
+  replay attacks using stale payment challenges.
+- Servers ****MUST**** ensure each `paymentId` is used at most once.
+- Servers ****MUST**** verify payment proofs before processing the DWN message.
+  A server ****MUST NOT**** process a message and then fail payment verification.
+- For the L402 scheme, servers ****MUST**** use cryptographically strong root keys
+  for macaroon signing and ****SHOULD**** rotate root keys periodically.
+- For the Cashu scheme, servers ****MUST**** verify proof state (unspent) with the
+  mint before processing the message, to prevent double-spend of ecash proofs.
+- For the x402 scheme, servers ****SHOULD**** verify the payment signature before
+  processing the message, either locally or via the facilitator's `/verify` endpoint.
+- The `dwn-payment` header ****SHOULD NOT**** exceed 8 KB. Implementations ****MAY****
+  reject requests with excessively large payment headers.
 
 ## Normative References
 
