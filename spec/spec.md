@@ -1016,7 +1016,6 @@ payment without registration, or neither.
 | `providerAuth.tokenUrl` | `string` | Yes | URL where the client exchanges an authorization code for a registration token. |
 | `providerAuth.refreshUrl` | `string` | No | URL to refresh an expired registration token. If absent, tokens do not support refresh. |
 | `providerAuth.managementUrl` | `string` | No | URL for user-facing account management. If absent, no management UI is available. |
-| `dataRetention` | `string` | No | `"full"` (default if absent) or `"cache"`. Indicates whether the server retains all record data or operates as a best-effort relay/cache. Corresponds to the `dataRetention` property in the DWN service endpoint entry. |
 | `payment` | `object` | No | Payment capabilities. ****MUST**** be present when the server supports [Per-Message Payment](#per-message-payment). |
 | `payment.methods` | `string[]` | Yes | Payment flow methods supported. See [Payment Methods](#payment-methods). |
 | `payment.schemes` | `string[]` | Yes | [[ref:Payment Scheme]] URN identifiers supported. See [Payment Scheme Registry](#payment-scheme-registry). |
