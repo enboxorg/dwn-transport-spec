@@ -35,6 +35,7 @@ Specifically, this specification covers:
 - **Tenant registration** for multi-tenant DWN servers
 - **Per-message payment** for usage-based DWN server monetization
 - **Sync orchestration** between DWN nodes
+- **Local transports** for on-device inter-process communication between DWN clients and servers
 
 ## Status of This Document
 
@@ -102,6 +103,24 @@ URN format (`urn:enbox:payment:<scheme>:<version>`) for global uniqueness.
 [[def:Payment Handler]]
 ~ A client-side component that can detect a supported [[ref:Payment Scheme]] in a
 `PaymentRequirements` object and produce a corresponding `PaymentProof`.
+
+[[def:Local Transport]]
+~ A transport binding that enables [[ref:DWN Client]] to [[ref:DWN Server]]
+communication between processes on the same device, without traversing the
+public network. Local transports reuse the [JSON-RPC 2.0 wire format](#json-rpc-wire-format)
+but differ in their connection establishment, discovery, and authentication
+mechanisms.
+
+[[def:Discovery File]]
+~ A JSON file written by a local [[ref:DWN Server]] process to advertise its
+availability to [[ref:DWN Clients]] on the same device. The default location is
+`~/.enbox/dwn.json`.
+
+[[def:Extension Bridge]]
+~ A browser extension that acts as a [[ref:Local Transport]] between web
+application JavaScript and a native [[ref:DWN Server]] process on the same
+device. The extension relays [[ref:JSON-RPC Envelope]] messages across the
+boundary between browser and native execution contexts.
 
 ## Service Endpoint Discovery {#service-endpoint-discovery}
 
@@ -1877,16 +1896,758 @@ Implementations ****SHOULD**** implement backoff when repeated sync attempts fin
 no changes, and ****SHOULD**** increase sync frequency when changes are detected.
 
 
+## Local Transport {#local-transport}
+
+### Overview {#local-transport-overview}
+
+The HTTP and WebSocket transports defined in earlier sections are designed for
+communication over the public network between remote parties. However, several
+important deployment scenarios involve [[ref:DWN Client]] to [[ref:DWN Server]]
+communication between processes on the **same device**:
+
+- A native mobile application communicating with a [[ref:DWN Server]] running as
+  a separate app on the same phone or tablet.
+- A browser extension bridging web application JavaScript to a native
+  [[ref:DWN Server]] process.
+- A desktop application communicating with a locally running [[ref:DWN Server]].
+
+These scenarios share a common requirement: the client and server are
+co-located on the same operating system, but run in separate process sandboxes
+with no shared memory. The messages exchanged are identical to those carried
+over HTTP or WebSocket — the same [[ref:JSON-RPC Envelope]] format, the same
+DWN message semantics, and the same authorization model — but the connection
+establishment, discovery, and authentication mechanisms differ.
+
+This section defines [[ref:Local Transport]] bindings for these scenarios.
+Because operating systems provide fundamentally different inter-process
+communication primitives, this specification defines platform-specific
+bindings rather than a single universal mechanism. All bindings share the
+JSON-RPC wire format and DWN message-level authorization as their common
+foundation.
+
+The following bindings are defined:
+
+| Binding | Platform | Mechanism | Subscriptions |
+|---------|----------|-----------|---------------|
+| [iOS Local Transport](#ios-local-transport) | iOS, macOS | Localhost HTTP/WebSocket | Yes (WebSocket) |
+| [Android Local Transport](#android-local-transport) | Android | AIDL Bound Service | Yes (callback interface) |
+| [Browser Extension Transport](#browser-extension-transport) | Cross-platform | Extension messaging to native handler | Yes (persistent port) |
+
+### Local Discovery {#local-discovery}
+
+Before a [[ref:DWN Client]] can communicate with a local [[ref:DWN Server]],
+it must discover whether a server is available and how to connect to it. This
+section defines discovery mechanisms that apply across platform bindings.
+
+#### Discovery File {#discovery-file}
+
+A local [[ref:DWN Server]] process ****MAY**** write a [[ref:Discovery File]] to
+advertise its availability. The file ****MUST**** be located at a well-known
+path and ****MUST**** contain a JSON object with the following properties:
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `endpoint` | `string` | Yes | The URL at which the server is listening (e.g., `http://127.0.0.1:55500`). |
+| `pid` | `number` | No | The operating system process ID of the server. Clients ****SHOULD**** verify the process is alive before connecting. |
+| `capabilities` | `array` | No | An array of strings indicating server capabilities (e.g., `["http", "ws"]`). |
+
+The default file path is:
+
+| Platform | Path |
+|----------|------|
+| macOS / Linux | `~/.enbox/dwn.json` |
+| Windows | `%APPDATA%\enbox\dwn.json` |
+| iOS / Android | Not applicable (no shared filesystem between apps from different developers). |
+
+::: example Discovery File
+```json
+{
+  "endpoint": "http://127.0.0.1:55500",
+  "pid": 12345,
+  "capabilities": ["http", "ws"]
+}
+```
+:::
+
+The server ****MUST**** remove or update the [[ref:Discovery File]] when it shuts
+down or changes its listening address. Clients ****SHOULD**** treat a stale
+discovery file (where `pid` refers to a dead process) as absent.
+
+#### Well-Known Port Probing {#well-known-port-probing}
+
+When no [[ref:Discovery File]] is available (or on platforms where filesystem-based
+discovery is not possible), clients ****MAY**** probe a set of well-known ports on
+the loopback interface.
+
+The well-known port set is:
+
+- `55500` through `55509` (inclusive)
+- `3000` (development convenience)
+
+For each candidate port, the client ****SHOULD**** send a `GET` request to
+`http://127.0.0.1:{port}/info` and validate that the response conforms to the
+[ServerInfo](#server-info-object) schema. Clients ****MUST**** try `127.0.0.1`
+rather than `localhost` to avoid DNS resolution ambiguity.
+
+Clients ****SHOULD**** probe ports sequentially and stop at the first valid
+response. Clients ****SHOULD**** cache a successful discovery result with a
+short TTL (****RECOMMENDED**** 10 seconds) to avoid repeated probing.
+
+#### Bonjour / mDNS Discovery {#bonjour-discovery}
+
+On Apple platforms (iOS, macOS), local [[ref:DWN Servers]] ****MAY**** advertise
+their availability via Bonjour (mDNS/DNS-SD) using the following service type:
+
+```
+_dwn._tcp
+```
+
+The TXT record ****SHOULD**** include the following keys:
+
+| Key | Description |
+|-----|-------------|
+| `did` | The DID of the primary tenant hosted by the server. |
+| `path` | The URL path prefix, if not `/` (default: `/`). |
+
+Clients ****MAY**** discover services using `NWBrowser` (Network framework) or
+equivalent platform APIs. Note that on iOS 14+, Bonjour discovery triggers a
+one-time Local Network permission dialog.
+
+#### Android Service Discovery {#android-service-discovery}
+
+On Android, [[ref:DWN Servers]] that expose an AIDL Bound Service (see
+[Android Local Transport](#android-local-transport)) ****MUST**** declare an
+`<intent-filter>` with the following action:
+
+```
+org.enbox.dwn.BIND_DWN_SERVICE
+```
+
+Clients ****MAY**** discover available DWN services using `PackageManager.queryIntentServices()`
+with this action. When multiple services are available, the client ****SHOULD****
+present a chooser or use a preference-based selection.
+
+### Local Authentication {#local-authentication}
+
+When a [[ref:DWN Client]] and [[ref:DWN Server]] communicate over the public
+network, TLS provides channel authentication and the DWN message's JWS
+authorization identifies the author. On a local transport, the channel itself
+may lack authentication — for example, any process on the device can connect to
+a localhost TCP port.
+
+Local transports ****SHOULD**** implement transport-level authentication to
+establish the identity of the connecting client before accepting DWN messages.
+This is **in addition to**, not a replacement for, the DWN message-level
+authorization defined in the [DWN specification](https://github.com/enboxorg/dwn-spec).
+
+#### Challenge-Response Authentication {#local-challenge-response}
+
+For transports where the operating system does not provide caller identity
+(e.g., localhost TCP on iOS), the following challenge-response flow is
+****RECOMMENDED****:
+
+1. The client connects to the server.
+2. The server generates a cryptographically random nonce (****RECOMMENDED**** 32
+   bytes, hex-encoded) and sends it to the client.
+3. The client signs the nonce using a DID key and returns the signature as a
+   compact JWS (RFC 7515) with the `kid` header set to the DID key ID.
+4. The server resolves the client's DID, verifies the JWS signature, and
+   determines whether the client is authorized.
+5. On success, the server issues an opaque session token. The client includes
+   this token in subsequent requests via an `Authorization: Bearer {token}`
+   header (for HTTP) or as a `sessionToken` field in the JSON-RPC params
+   (for non-HTTP transports).
+
+Session tokens ****MUST**** be time-limited. Servers ****SHOULD**** expire tokens
+after a ****RECOMMENDED**** maximum of 1 hour. Clients ****MUST**** re-authenticate
+when a token expires.
+
+#### Platform-Native Caller Verification {#platform-caller-verification}
+
+On platforms that provide OS-level caller identity, servers ****MAY**** use the
+platform mechanism instead of or in addition to the challenge-response flow:
+
+- **Android:** `Binder.getCallingUid()` identifies the calling app's UID. The
+  server can resolve this to a package name and signing certificate via
+  `PackageManager`, providing cryptographically strong caller identity without
+  any application-level handshake.
+
+- **iOS (same developer):** When the client and server share an App Group (same
+  developer team), shared Keychain items or App Group containers can be used to
+  exchange authentication tokens out of band.
+
+### iOS Local Transport {#ios-local-transport}
+
+#### Mechanism {#ios-mechanism}
+
+On iOS, cross-developer inter-process communication is limited to the loopback
+network interface. The iOS [[ref:Local Transport]] reuses the
+[HTTP transport](#http-transport) and [WebSocket transport](#websocket-transport)
+defined in this specification, with the server bound to `127.0.0.1` instead of
+a public network interface.
+
+All rules defined in the HTTP and WebSocket transport sections apply unchanged,
+with the following exceptions:
+
+- **TLS is not required.** Plaintext `http://` and `ws://` connections are
+  permitted on the loopback interface (`127.0.0.1`). See
+  [TLS Requirements](#tls-requirements).
+- **CORS:** The server ****MUST**** accept requests from browser extension
+  origins (e.g., `safari-web-extension://` scheme). See
+  [Browser Extension Transport](#browser-extension-transport).
+
+#### Discovery {#ios-discovery}
+
+iOS does not provide a shared filesystem between apps from different developers.
+The [[ref:Discovery File]] mechanism is not available on iOS for cross-developer
+scenarios.
+
+Clients ****SHOULD**** use [Well-Known Port Probing](#well-known-port-probing)
+as the primary discovery mechanism. Clients ****MAY**** additionally use
+[Bonjour / mDNS Discovery](#bonjour-discovery).
+
+Clients ****MAY**** use `UIApplication.canOpenURL()` with the `dwn://` scheme
+(if registered by the server app) to determine whether a DWN app is installed,
+but this does not indicate whether the server is currently listening.
+
+#### Activation {#ios-activation}
+
+A local [[ref:DWN Server]] app on iOS may be suspended by the operating system
+when it is not in the foreground. Clients ****MAY**** activate a suspended server
+using a registered URL scheme:
+
+1. The client opens a URL of the form `dwn://activate`.
+2. The operating system foregrounds the server app, which starts its
+   localhost listener.
+3. The server app ****MAY**** call back to the client via the client's registered
+   URL scheme to signal readiness.
+4. The client connects to the server's localhost endpoint.
+
+::: note
+URL scheme activation causes a visible app switch. Both the client and server
+apps can use `beginBackgroundTask` to obtain approximately 30 seconds of
+background execution time for completing the IPC transaction.
+:::
+
+#### Background Constraints {#ios-background}
+
+iOS suspends app processes within seconds of entering the background. A local
+[[ref:DWN Server]] on iOS is **not** a persistent server. Clients ****MUST****
+be prepared for the server to become unreachable at any time and ****SHOULD****
+implement retry with re-activation when a connection fails.
+
+Implementations ****MUST NOT**** rely on background execution entitlements
+(audio, location, VoIP) solely for the purpose of maintaining a DWN server
+listener. Such usage violates Apple's App Store guidelines.
+
+### Android Local Transport {#android-local-transport}
+
+#### Mechanism {#android-mechanism}
+
+On Android, the [[ref:Local Transport]] uses an
+[AIDL (Android Interface Definition Language)](https://developer.android.com/guide/components/aidl)
+Bound Service. This is the platform-native inter-process communication
+mechanism and provides:
+
+- Automatic service lifecycle management (the server process is started on
+  demand via `BIND_AUTO_CREATE`).
+- OS-enforced caller identity via `Binder.getCallingUid()`.
+- Bidirectional communication with callback interfaces for subscriptions.
+- Streaming binary data via `ParcelFileDescriptor` pipes.
+
+#### AIDL Interface {#android-aidl-interface}
+
+A local [[ref:DWN Server]] on Android ****MUST**** expose a Bound Service
+implementing the following AIDL interface:
+
+```java
+// IDwnService.aidl
+package org.enbox.dwn;
+
+import org.enbox.dwn.IDwnCallback;
+
+interface IDwnService {
+    /**
+     * Process a DWN JSON-RPC message without binary data.
+     *
+     * @param jsonRpcRequest JSON-serialized JsonRpcRequest
+     * @return JSON-serialized JsonRpcResponse
+     */
+    String processMessage(String jsonRpcRequest);
+
+    /**
+     * Process a DWN JSON-RPC message with an associated binary data stream.
+     * Used for RecordsWrite (client sends data) and RecordsRead (server
+     * returns data).
+     *
+     * @param jsonRpcRequest JSON-serialized JsonRpcRequest
+     * @param dataIn ParcelFileDescriptor for the client-to-server data
+     *               stream, or null for read operations
+     * @return Bundle containing:
+     *         - "jsonrpc_response" (String): JSON-serialized JsonRpcResponse
+     *         - "data_out" (ParcelFileDescriptor): server-to-client data
+     *           stream, or null if the response has no data
+     */
+    Bundle processMessageWithData(String jsonRpcRequest,
+                                  in ParcelFileDescriptor dataIn);
+
+    /**
+     * Open a subscription.
+     *
+     * @param jsonRpcRequest JSON-serialized JsonRpcRequest with method
+     *                       "rpc.subscribe.dwn.processMessage"
+     * @param callback Callback interface for receiving subscription events
+     * @return JSON-serialized JsonRpcResponse (the subscribe acknowledgment)
+     */
+    String subscribe(String jsonRpcRequest, IDwnCallback callback);
+
+    /**
+     * Close an active subscription.
+     *
+     * @param subscriptionId The subscription ID to close
+     */
+    void unsubscribe(String subscriptionId);
+
+    /**
+     * Retrieve server information.
+     *
+     * @return JSON-serialized ServerInfo object
+     */
+    String getServerInfo();
+}
+```
+
+```java
+// IDwnCallback.aidl
+package org.enbox.dwn;
+
+oneway interface IDwnCallback {
+    /**
+     * Deliver a subscription event.
+     *
+     * @param subscriptionId The subscription this event belongs to
+     * @param jsonRpcEvent JSON-serialized JsonRpcResponse containing
+     *                     a SubscriptionMessage in result.subscription
+     */
+    void onEvent(String subscriptionId, String jsonRpcEvent);
+
+    /**
+     * Signal that the server has closed the subscription.
+     *
+     * @param subscriptionId The closed subscription ID
+     * @param reason Human-readable reason for closure
+     */
+    void onClose(String subscriptionId, String reason);
+}
+```
+
+The `IDwnCallback` interface is declared `oneway` (asynchronous) so that the
+server does not block waiting for the client to process each event.
+
+#### JSON-RPC Mapping {#android-json-rpc-mapping}
+
+The AIDL interface passes [[ref:JSON-RPC Envelope]] messages as `String`
+parameters. The JSON-RPC request and response objects are identical to those
+defined in the [JSON-RPC 2.0 Wire Format](#json-rpc-wire-format) section. The
+AIDL layer is a transport for these envelopes, not a replacement for them.
+
+For messages without binary data (`RecordsQuery`, `RecordsDelete`,
+`ProtocolsConfigure`, etc.), clients call `processMessage()` and receive the
+JSON-RPC response as a return value.
+
+For messages with binary data:
+
+- **RecordsWrite (client sends data):** The client creates a
+  `ParcelFileDescriptor` pipe, writes the record data to the write end, and
+  passes the read end to `processMessageWithData()`. The JSON-RPC request in
+  the `jsonRpcRequest` parameter is identical to the `dwn-request` header
+  content in the HTTP transport.
+
+- **RecordsRead (server returns data):** The server creates a pipe, writes
+  the record data to the write end, and returns the read end in the
+  `data_out` field of the result `Bundle`. The JSON-RPC response in the
+  `jsonrpc_response` field is identical to the `dwn-response` header content
+  in the HTTP transport.
+
+#### Service Declaration {#android-service-declaration}
+
+The DWN server app ****MUST**** declare the service in its `AndroidManifest.xml`:
+
+```xml
+<service
+    android:name=".DwnNodeService"
+    android:exported="true"
+    android:permission="org.enbox.dwn.permission.ACCESS_DWN">
+    <intent-filter>
+        <action android:name="org.enbox.dwn.BIND_DWN_SERVICE" />
+    </intent-filter>
+</service>
+```
+
+The server app ****SHOULD**** declare a custom permission for access control:
+
+```xml
+<permission
+    android:name="org.enbox.dwn.permission.ACCESS_DWN"
+    android:label="Access DWN Node"
+    android:description="Allows an application to communicate with the
+                         local Decentralized Web Node"
+    android:protectionLevel="dangerous" />
+```
+
+A `protectionLevel` of `"dangerous"` requires runtime user consent before a
+client app can bind to the service. The server app ****MAY**** additionally
+verify the calling app's signing certificate via
+`PackageManager.getPackageInfo()` and `SigningInfo` to enforce an allowlist
+of authorized clients.
+
+#### Service Binding {#android-service-binding}
+
+Clients bind to the DWN service using an explicit intent:
+
+```java
+Intent intent = new Intent("org.enbox.dwn.BIND_DWN_SERVICE");
+intent.setPackage("org.enbox.dwn.server"); // target package
+
+context.bindService(intent, serviceConnection,
+    Context.BIND_AUTO_CREATE);
+```
+
+When `BIND_AUTO_CREATE` is specified, the operating system starts the server
+app's process if it is not already running. The client receives the `IBinder`
+in its `ServiceConnection.onServiceConnected()` callback.
+
+If the server process is killed by the system, the client receives
+`onServiceDisconnected()`. Clients ****SHOULD**** implement reconnection with
+exponential backoff.
+
+#### Subscription Delivery {#android-subscription-delivery}
+
+The server delivers subscription events by invoking methods on the
+`IDwnCallback` interface provided by the client during `subscribe()`. The
+server ****SHOULD**** use `RemoteCallbackList` to manage callbacks, which
+automatically unregisters callbacks when the client process dies.
+
+The JSON-RPC event messages delivered via `onEvent()` are identical in format
+to the subscription events defined in
+[Subscription Events](#ws-subscription-events). The same `type` discriminator
+(`"event"` or `"eose"`) and cursor semantics apply.
+
+Flow control follows the same principles as
+[WebSocket Flow Control](#ws-flow-control): the server ****SHOULD**** limit the
+number of unacknowledged events per subscription. The client acknowledges events
+by calling `processMessage()` with an `rpc.ack` JSON-RPC notification.
+
+### Browser Extension Transport {#browser-extension-transport}
+
+#### Overview {#extension-overview}
+
+An [[ref:Extension Bridge]] enables web applications running in a browser to
+communicate with a native [[ref:DWN Server]] process on the same device. The
+extension relays [[ref:JSON-RPC Envelope]] messages between the web page's
+JavaScript context and the native DWN, traversing the browser's security
+boundaries via the standard WebExtension messaging APIs.
+
+This transport is particularly relevant on iOS, where a Safari Web Extension
+bundled with a native DWN app allows any web application to use the device's
+native DWN instead of an in-browser implementation backed by IndexedDB.
+
+#### Extension Architecture {#extension-architecture}
+
+The [[ref:Extension Bridge]] consists of the following components:
+
+```
+Web Page JavaScript
+    | window.postMessage() or CustomEvent
+    v
+Content Script (injected into the page)
+    | browser.runtime.sendMessage()
+    v
+Background Service Worker
+    | browser.runtime.sendNativeMessage()
+    v
+Native App Handler (NSExtensionRequestHandling on iOS)
+    | In-process call
+    v
+DWN Node (native process, shared App Group storage)
+```
+
+Each component runs in a separate execution context:
+
+| Component | Process | Lifecycle |
+|-----------|---------|-----------|
+| Web page JavaScript | Safari Web Content process | Page lifetime |
+| Content script | Safari Web Content process (isolated world) | Page lifetime |
+| Background service worker | Extension process | Terminated after ~30s idle (MV3) |
+| Native app handler | App extension process | Request lifetime |
+| DWN node | App extension process or containing app | Varies by implementation |
+
+#### Discovery {#extension-discovery}
+
+The content script ****MUST**** signal its availability to the web page by
+setting a property on the `document` element:
+
+```javascript
+document.documentElement.setAttribute('data-dwn-extension', 'true');
+```
+
+Web applications ****MAY**** check for this attribute to determine whether an
+[[ref:Extension Bridge]] is available. Applications that detect the extension
+****MAY**** use it as the DWN transport instead of constructing an in-browser
+DWN instance.
+
+The content script ****MAY**** additionally dispatch a `CustomEvent` on the
+`document` to notify applications that load before the content script is
+injected:
+
+```javascript
+document.dispatchEvent(new CustomEvent('dwn-extension-available', {
+  detail: { version: '1.0' }
+}));
+```
+
+#### Message Format {#extension-message-format}
+
+Messages exchanged between the web page and the content script ****MUST**** use
+the following envelope:
+
+```json
+{
+  "type": "dwn-request",
+  "id": "unique-request-id",
+  "payload": {
+    "jsonrpc": "2.0",
+    "id": "rpc-id",
+    "method": "dwn.processMessage",
+    "params": {
+      "target": "did:example:alice",
+      "message": { }
+    }
+  },
+  "data": "<base64-encoded binary data, if any>"
+}
+```
+
+The `payload` field contains the standard [[ref:JSON-RPC Envelope]] as defined
+in the [JSON-RPC 2.0 Wire Format](#json-rpc-wire-format) section.
+
+Binary data (for `RecordsWrite` payloads) ****MUST**** be base64-encoded in the
+`data` field. The content script, background service worker, and native handler
+relay this field without modification. The native handler decodes the base64
+data and provides it to the DWN as a data stream.
+
+Response messages use the same envelope with `"type": "dwn-response"`:
+
+```json
+{
+  "type": "dwn-response",
+  "id": "unique-request-id",
+  "payload": {
+    "jsonrpc": "2.0",
+    "id": "rpc-id",
+    "result": {
+      "reply": {
+        "status": { "code": 200, "detail": "OK" }
+      }
+    }
+  },
+  "data": "<base64-encoded response data, if any>"
+}
+```
+
+#### Page-to-Content-Script Communication {#extension-page-content}
+
+The web page sends requests to the content script using `window.postMessage()`:
+
+```javascript
+window.postMessage({
+  type: 'dwn-request',
+  id: requestId,
+  payload: jsonRpcRequest,
+  data: base64Data
+}, window.location.origin);
+```
+
+The content script listens on the `message` event and filters by `type`. The
+content script ****MUST**** verify that `event.origin` matches the page's origin
+and that `event.source === window` to prevent cross-frame message injection.
+
+The content script sends responses back via the same mechanism:
+
+```javascript
+window.postMessage({
+  type: 'dwn-response',
+  id: requestId,
+  payload: jsonRpcResponse,
+  data: base64Data
+}, window.location.origin);
+```
+
+#### Subscription Support {#extension-subscriptions}
+
+For subscriptions (`RecordsSubscribe`, `MessagesSubscribe`), the extension
+****MUST**** use `browser.runtime.connectNative()` to establish a persistent
+port to the native handler. The native handler maintains the DWN subscription
+and pushes events through the port.
+
+The event delivery chain for subscriptions is:
+
+```
+DWN Node (subscription event)
+    | Native handler pushes event via persistent port
+    v
+Background Service Worker
+    | browser.tabs.sendMessage(tabId, event)
+    v
+Content Script
+    | window.postMessage(event)
+    v
+Web Page JavaScript (subscription handler invoked)
+```
+
+Subscription event messages use `"type": "dwn-subscription-event"` and contain
+the same [[ref:SubscriptionMessage]] format defined in
+[Subscription Events](#ws-subscription-events):
+
+```json
+{
+  "type": "dwn-subscription-event",
+  "subscriptionId": "sub-1",
+  "payload": {
+    "type": "event",
+    "cursor": "...",
+    "event": {
+      "message": { },
+      "initialWrite": { }
+    }
+  }
+}
+```
+
+Because the background service worker may be terminated after ~30 seconds of
+inactivity (Manifest V3), the extension ****SHOULD**** use `browser.alarms`
+to periodically wake the service worker and re-establish the `connectNative()`
+port if it was dropped. Clients ****SHOULD**** persist the last received cursor
+and resume subscriptions from that point after reconnection.
+
+#### Large Data Transfer {#extension-large-data}
+
+Extension messaging channels have practical size limits (typically a few
+megabytes). For `RecordsWrite` operations with data payloads that exceed
+the messaging limit, implementations ****MAY**** use an alternative data
+transfer mechanism:
+
+1. The native handler starts a temporary localhost HTTP listener.
+2. The extension returns a `data_url` field in the response pointing to
+   `http://127.0.0.1:{port}/{path}`.
+3. The web page fetches the data directly from the localhost URL.
+
+This hybrid approach uses extension messaging for the JSON-RPC control plane
+and localhost HTTP for the data plane. The temporary listener ****SHOULD**** be
+shut down after the transfer completes or after a timeout.
+
+#### Safari Web Extension Specifics {#safari-extension-specifics}
+
+On iOS, Safari Web Extensions are bundled within a containing iOS app. The
+extension and containing app share an App Group container, enabling:
+
+- Shared persistent storage (the DWN's database files).
+- Shared Keychain items (cryptographic keys).
+- Shared `UserDefaults` (configuration, discovery state).
+
+The native app handler (`NSExtensionRequestHandling`) runs in the app extension
+process, which is separate from the containing app's process. However, both
+processes can access the shared App Group container simultaneously.
+
+The extension's `manifest.json` ****MUST**** declare the following permissions
+for localhost communication (used by the [large data transfer](#extension-large-data)
+fallback and [direct fetch](#extension-direct-fetch) paths):
+
+```json
+{
+  "host_permissions": ["http://127.0.0.1/*"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:*"
+  }
+}
+```
+
+#### Direct Fetch Path {#extension-direct-fetch}
+
+As an optimization, the background service worker ****MAY**** communicate
+directly with a localhost [[ref:DWN Server]] via `fetch()` or `WebSocket`,
+bypassing the native messaging chain entirely. This is viable when:
+
+- The DWN server is running and listening on localhost (discovered via
+  [Well-Known Port Probing](#well-known-port-probing)).
+- The extension has `host_permissions` for `http://127.0.0.1/*`.
+
+In this mode, the extension functions as a thin proxy: the content script
+relays messages to the background service worker, which makes HTTP requests
+or opens WebSocket connections to `http://127.0.0.1:{port}` using the
+standard [HTTP transport](#http-transport) or
+[WebSocket transport](#websocket-transport).
+
+This path provides better performance (fewer hops) and supports all DWN
+operations including binary data transfer and subscriptions, but requires the
+DWN server to be actively listening on localhost.
+
+### Local Transport Security Considerations {#local-transport-security}
+
+#### Port Binding Races {#port-binding-races}
+
+On platforms where the DWN server listens on a localhost TCP port (iOS, desktop),
+a malicious local application could bind to the same port before the DWN server
+starts, intercepting client connections. Mitigations include:
+
+- Clients ****SHOULD**** verify the server's identity via the
+  [ServerInfo](#server-info-object) response before sending DWN messages.
+- Clients ****SHOULD**** use [Local Authentication](#local-authentication) to
+  establish mutual trust.
+- Server implementations ****SHOULD**** bind to a random available port and
+  advertise it via the [[ref:Discovery File]] or Bonjour, rather than relying
+  solely on well-known ports.
+
+#### Extension Origin Verification {#extension-origin-verification}
+
+Content scripts ****MUST**** verify the `origin` of `window.postMessage` events
+to prevent malicious iframes or cross-origin scripts from injecting DWN
+requests. Content scripts ****SHOULD**** only process messages where
+`event.source === window` and `event.origin` matches the top-level page origin.
+
+#### Session Token Security {#session-token-security}
+
+Session tokens issued by the [Local Authentication](#local-authentication) flow
+****MUST**** be cryptographically random, at least 256 bits in length, and
+transmitted only over the local transport channel. Tokens ****MUST NOT**** be
+stored in locations accessible to other applications.
+
+#### Multi-User Device Concerns {#multi-user-devices}
+
+On devices with multiple user accounts (Android multi-user, macOS fast user
+switching), the loopback interface is shared across all users. DWN server
+implementations ****MUST**** authenticate connecting clients and ****MUST NOT****
+assume that all localhost connections originate from the same user.
+
+
 ## Security Considerations {#security-considerations}
 
 ### TLS Requirements {#tls-requirements}
 
-All HTTP and WebSocket connections ****MUST**** use TLS.
+All HTTP and WebSocket connections to remote [[ref:DWN Servers]] ****MUST**** use TLS.
 [[ref:Service Endpoint]] URLs ****MUST**** use the `https` scheme.
-WebSocket connections ****MUST**** use `wss`.
+WebSocket connections to remote servers ****MUST**** use `wss`.
 
-Plaintext `http` and `ws` connections ****MUST NOT**** be used in production.
-Implementations ****MAY**** permit plaintext connections for local development only.
+Plaintext `http` and `ws` connections ****MUST NOT**** be used for remote
+communication in production. Implementations ****MAY**** permit plaintext
+connections for local development only.
+
+**Exception for Local Transports:** [[ref:Local Transport]] connections to the
+loopback interface (`127.0.0.1`) ****MAY**** use plaintext `http` and `ws`.
+Traffic on the loopback interface does not traverse any network and is not
+subject to the same interception risks as remote connections. See
+[iOS Local Transport](#ios-local-transport) and
+[Browser Extension Transport](#browser-extension-transport).
 
 ### Rate Limiting {#rate-limiting}
 
