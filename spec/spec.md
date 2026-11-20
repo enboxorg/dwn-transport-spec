@@ -87,7 +87,9 @@ message.
 
 [[def:Progress Token]]
 ~ A position in a tenant's message feed, `{ streamId, epoch, position, messageCid? }`,
-as defined in the DWN specification. A client treats it as opaque.
+as defined in the DWN specification. A client ****MUST NOT**** synthesize or
+modify its fields, and compares `position` numerically (BigInt-safe) only within
+the same `(streamId, epoch)` domain.
 
 [[def:Local Node]]
 ~ A [[ref:DWN Server]] that runs on the user's own device and accepts
@@ -103,7 +105,7 @@ programs on the device where it is listening.
 | A client wants to | It uses |
 |---|---|
 | Find a DID's servers | The DID document's `DecentralizedWebNode` service ([Service Endpoint Discovery](#service-endpoint-discovery)) |
-| Send a DWN message and get the reply | `dwn.processMessage` over HTTP, or over WebSocket for messages without data |
+| Send a DWN message and get the reply | `dwn.processMessage` over HTTP, or over WebSocket for non-`RecordsWrite` messages without streamed data |
 | Write or read record data | `dwn.processMessage` over HTTP; the data travels in the body |
 | Deliver a message during synchronization | `dwn.applyReplicatedMessage` |
 | Follow changes as they happen | `rpc.subscribe.dwn.processMessage` over WebSocket |
@@ -271,7 +273,7 @@ verdict is the `status` inside `result.reply`. A reply with status `401`,
 |---|---|---|
 | `-32600` | `InvalidRequest` | A subscription is attempted over HTTP, or without a `subscription` object; or the tenant is over its quota (see below) |
 | `-32601` | `MethodNotFound` | The method is unknown |
-| `-32602` | `InvalidParams` | The parameters are missing or invalid; a subscription ID is already in use, or is unknown; or the request is not allowed on this transport |
+| `-32602` | `InvalidParams` | The parameters are missing or invalid; a subscription ID is already in use, or is unknown on `rpc.subscribe.close`; or the request is not allowed on this transport |
 | `-32603` | `InternalError` | The server failed unexpectedly |
 | `-50400` | `BadRequest` | The HTTP framing is malformed, or a WebSocket frame is empty or not valid JSON |
 | `-50403` | `Forbidden` | The caller may not use an option reserved for local callers |
@@ -316,12 +318,13 @@ Record data never travels inside this method's JSON:
   [Request Framing](#request-framing)). A server ****MUST**** therefore reject
   every `RecordsWrite` sent with this method over WebSocket, with `-32602`.
 - The data of a `RecordsRead` or `MessagesRead` reply is sent in the HTTP
-  response body (see [HTTP Responses](#http-responses)). Over WebSocket the
-  reply arrives without its data, so a client ****SHOULD**** send reads over
-  HTTP.
+  response body (see [HTTP Responses](#http-responses)), even when the record
+  is small enough to be stored inline. Over WebSocket the reply always arrives
+  without its data, so a client ****SHOULD**** send reads over HTTP.
 
-Data small enough to be inline, in `encodedData`, is part of the reply itself
-and is unaffected.
+Inline `encodedData` (at most 30,000 bytes) appears only in query,
+subscription, and replication-support replies, which travel inside the JSON
+reply itself and are unaffected.
 
 #### `dwn.applyReplicatedMessage`
 
@@ -347,9 +350,10 @@ when a node reports each, are defined by the
 - `ancestryOnly` — ****OPTIONAL****. If present it ****MUST**** be `true`. It states that the caller is deliberately sending an initial `RecordsWrite` without its data, so that the node can validate the record's descendants. The message ****MUST**** then be an initial `RecordsWrite`, and no data may accompany it.
 - `includeMaterializationConfirmation` — ****OPTIONAL****. `true` asks the node to report whether it holds the record's data. Because the answer reveals what the node stores, a server ****MUST**** accept `true` only over HTTP, and only from a caller authenticated under the [Local Node Profile](#local-node-profile). `false` has no effect.
 
-A request that breaks one of these rules is answered with `-32602`, except
-that `includeMaterializationConfirmation: true` from a caller that is not a
-local caller is answered with `-50403`.
+A request that breaks one of these rules is answered with `-32602` (checked
+first, including `includeMaterializationConfirmation: true` sent over
+WebSocket), except that `includeMaterializationConfirmation: true` over HTTP
+from a caller that is not a local caller is answered with `-50403`.
 
 Over WebSocket, a `RecordsWrite` whose `dataSize` is greater than zero is
 accepted only with `encodedData` or with `ancestryOnly: true`.
@@ -486,9 +490,11 @@ dwn-response: {"jsonrpc":"2.0","id":"abc-789","result":{"reply":{"status":{"code
 | `500` | Any other JSON-RPC error | The JSON-RPC error response |
 | `401`, `403` | Only under the [Local Node Profile](#local-node-profile) | See there |
 
-A client therefore reads the JSON-RPC response on `200`, `400`, `429`, and
-`500` alike, and looks for the node's verdict in `result.reply.status` only
-when the response is a success.
+A client therefore checks `429` before assuming a JSON-RPC envelope (because
+per-IP `429` carries plain JSON rather than JSON-RPC), reads the JSON-RPC
+response on `200`, `400`, per-tenant `429`, and `500`, and on JSON-RPC success
+reads the outcome from `result.reply.status` (`dwn.processMessage`),
+`result.result` (`dwn.applyReplicatedMessage`), or `result.ok` (`rpc.ping`).
 
 ### CORS
 
@@ -617,9 +623,25 @@ that a slow client cannot make it buffer without bound.
 - Further messages wait in a buffer. The reference server holds up to 1000.
 - When the buffer is full, the server stops reading from the feed for that
   subscription. If no acknowledgement frees space within 30 seconds, it sends
-  an `error` message with code `SubscriptionBufferTimeout` and closes the
-  subscription. If the buffer is overrun regardless, it sends
-  `SubscriptionBufferOverflow` and closes the subscription.
+  an `error` subscription message with code `SubscriptionBufferTimeout` and
+  closes the subscription. If the buffer is overrun regardless, it sends
+  `SubscriptionBufferOverflow` and closes the subscription:
+  ```json
+  {
+    "jsonrpc": "2.0",
+    "id": "sub-1",
+    "result": {
+      "subscription": {
+        "type": "error",
+        "cursor": { "streamId": "8f3a…", "epoch": "6d1e…", "position": "44", "messageCid": "bafyrei..." },
+        "error": { "code": "SubscriptionBufferTimeout", "detail": "Subscription acknowledgement timed out" }
+      }
+    }
+  }
+  ```
+  The `cursor` on a transport `error` message identifies the failed/unacknowledged
+  position; a client ****MUST NOT**** advance its durable checkpoint or resume
+  cursor to it.
 
 A client acknowledges with `rpc.ack`, passing the `cursor` of a message it
 received:
@@ -691,6 +713,7 @@ GET /:did/read/records/:recordId
 | Node's reply | HTTP response |
 |---|---|
 | `200`, with data | `200`. The body is the record's data, with `Content-Type` set to the record's `dataFormat`. The `dwn-response` header holds the `RecordsRead` reply as JSON |
+| `200`, without data | `400`, with an empty body |
 | `401` | `404`, with an empty body |
 | Any other status | That status, with the reply as a JSON body |
 
@@ -710,8 +733,10 @@ GET /:did/read/modules/:module/:modulePath
   [Query Records](#query-records).
 
 The server finds the most recently published record that matches, and answers
-as for [Read a Record](#read-a-record). It answers `404` if none matches, and
-`400` if the module path is empty.
+as for [Read a Record](#read-a-record). It answers `404` if none matches, `400`
+if the module path is empty, `:module` is not valid base64url, or `filter.*`
+parameters are invalid, and forwards any other intermediate query status with an
+empty body.
 
 ### Read a Module Definition
 
@@ -719,8 +744,10 @@ as for [Read a Record](#read-a-record). It answers `404` if none matches, and
 GET /:did/read/modules/:module
 ```
 
-Answers `200` with the module's `ModulesConfigure` message as JSON, or `404`
-if the module is not installed or not published.
+`:module` is the module URI, base64url-encoded. Answers `200` with the module's
+`ModulesConfigure` message as JSON, `400` if `:module` is not valid base64url,
+`404` if the module is not installed or not published, or the node's status with
+an empty body on other failures.
 
 ### List Module Definitions
 
@@ -729,7 +756,7 @@ GET /:did/query/modules
 ```
 
 Answers `200` with a JSON array of the `ModulesConfigure` messages of the
-tenant's published modules.
+tenant's published modules (or the node's status with an empty body on failure).
 
 ### Query Records
 
@@ -755,7 +782,7 @@ Every value is passed as a string. Properties that are not strings, such as
 `pagination.limit`, therefore cannot be set this way; a client that needs
 them uses `dwn.processMessage`.
 
-::: example Query Records
+::: example Query Records Request
 ```
 GET /did:example:alice/query?filter.module=https://social.example/modules/feed&filter.modulePath=post&dateSort=publishedDescending
 ```
@@ -802,7 +829,8 @@ The reference client caches this document for 15 minutes.
 
 ### `GET /health`
 
-Returns `200` with `{"ok": true}`.
+Returns `200` with `{"ok": true}` (requires bearer authentication under the
+[Local Node Profile](#local-node-profile)).
 
 ## Tenant Registration
 
@@ -847,8 +875,9 @@ that the client will submit.
 Because the hash covers `registrationData`, a solution cannot be reused for
 another DID. It also means the server hashes the JSON as *it* re-serializes
 what it received, with the properties in the order they arrived and no
-whitespace. A client ****MUST**** therefore send, and hash, `registrationData`
-in exactly that form: `{"did":"…","termsOfServiceHash":"…"}`.
+whitespace. A client ****MUST**** therefore send and hash `registrationData`
+with compact JSON and no extra whitespace: `{"did":"…","termsOfServiceHash":"…"}`
+when the server advertises `terms-of-service`, or `{"did":"…"}` when it does not.
 
 The server changes `challengeNonce` periodically and accepts the previous one
 for a while. It adjusts `maximumAllowedHashValue` to the rate at which
@@ -874,11 +903,12 @@ again. Until it does, the server does not process messages for it.
 With `provider-auth-v0`, an account provider vouches for the user instead of
 a proof of work. `providerAuth` in `GET /info` gives the provider's URLs.
 
-1. The client sends the user to `authorizeUrl`, with the query parameters
-   `redirect_uri` and a random `state`.
+1. The client sends the user via `GET` to `authorizeUrl`, with the query
+   parameters `redirect_uri` and a random `state`.
 2. When the user has signed in, the provider returns an authorization `code`
    and the same `state`, normally by redirecting to `redirect_uri`.
-3. The client exchanges the code at `tokenUrl`:
+3. The client exchanges the code via `POST` to `tokenUrl` with
+   `Content-Type: application/json`:
    ```json
    { "grantType": "authorization_code", "code": "<code>", "redirectUri": "<redirect_uri>" }
    ```
@@ -888,7 +918,8 @@ a proof of work. `providerAuth` in `GET /info` gives the provider's URLs.
    ```
    `refreshToken` and `expiresIn` are optional.
 4. If the provider has a `refreshUrl`, the client can get a new token there
-   with `{ "grantType": "refresh_token", "refreshToken": "<token>" }`.
+   via `POST` with `Content-Type: application/json` and body
+   `{ "grantType": "refresh_token", "refreshToken": "<token>" }`.
 
 How a server checks a `registrationToken` is its own business. The reference
 server can verify it as a JWT, and can also act as a simple provider itself
@@ -929,8 +960,9 @@ or, with a provider's token in place of `proofOfWork`:
   ignores `proofOfWork`. A request with neither is refused.
 - When the server has terms of service, the registration ****MUST**** carry
   their hash, whichever credential is used. A registration by proof of work
-  without it is refused. A registration by provider token without it is
-  recorded, but the tenant is not active (see [Terms of Service](#terms-of-service)).
+  without it is refused. A registration by provider token with a mismatched
+  hash is refused with `400`; one omitting the hash is recorded, but the tenant
+  is not active (see [Terms of Service](#terms-of-service)).
 
 | Response | Body |
 |---|---|
@@ -991,11 +1023,15 @@ that are already paired. `Access-Control-Allow-Headers` is
 
 ### Pairing
 
-Pairing is how a web application gets a token.
+Pairing is how a web application gets a token. A local node advertises its
+pairing URLs in `GET /info` under `localPairing`:
+`{ "pairUrl": "<baseUrl>/local/pair", "pollUrlTemplate": "<baseUrl>/local/pair/{requestId}" }`,
+where the client replaces the literal `{requestId}` placeholder with the
+percent-encoded `requestId`.
 
-**1. Ask.** The application sends `POST /local/pair`. The body is ignored;
-the server reads the `Origin` header, which the browser sets and a page
-cannot forge.
+**1. Ask.** The application sends `POST /local/pair` (at `localPairing.pairUrl`).
+The body is ignored; the server reads the `Origin` header, which the browser
+sets and a page cannot forge.
 
 ```json
 { "requestId": "<uuid>", "status": "pending" }
@@ -1011,8 +1047,9 @@ after 5 minutes.
 whether to trust the origin. A local node may be configured with origins it
 approves without asking.
 
-**3. Poll.** The application polls `GET /local/pair/:requestId`, from the same
-origin. A poll from any other origin is answered with `404`.
+**3. Poll.** The application polls `GET /local/pair/:requestId` (expanding
+`localPairing.pollUrlTemplate`), from the same origin. A poll from any other
+origin is answered with `404` (and an empty `:requestId` with `400`).
 
 ```json
 { "status": "approved", "origin": "https://app.example", "token": "<token>" }
@@ -1026,8 +1063,9 @@ request that has been decided can still be polled for 5 minutes.
 
 **4. Check.** An application that already has a token can test it with
 `GET /local/status`, which answers
-`{ "localNode": true, "origin": "<origin>", "paired": true }`, or `401` if
-the token is no longer valid.
+`{ "localNode": true, "origin": "<origin>", "paired": true }` (omitting
+`origin` when authenticated with a device-program `localNodeToken`), or `401`
+if the token is no longer valid.
 
 A token for an origin stays valid until the user revokes it on the device.
 There is no route for revoking one. When a token is revoked, the local node
@@ -1145,10 +1183,13 @@ a starting point for other clients.
   request whose body is a stream that cannot be sent twice.
 - **Choosing a transport.** Requests go over HTTP by default. When a
   WebSocket connection to the server is already open, a request that carries
-  no data stream and whose JSON is at most 64 KiB is sent over it instead:
-  queries, deletes, module operations, and replicated messages whose data is
-  absent or small enough to send as `encodedData`. Reads of record data, and
-  `RecordsWrite` messages sent with `dwn.processMessage`, always use HTTP.
+  no data stream (and no custom `signal`, `timeoutMs`, or
+  `includeMaterializationConfirmation: true`) and whose JSON is at most 64 KiB
+  is sent over it instead: queries, deletes, module operations, and replicated
+  messages whose data is absent or a small buffered value (`Blob`/`ArrayBuffer`/
+  typed array) sent as `encodedData`. All `RecordsRead` and `MessagesRead`
+  requests, `RecordsWrite` messages sent with `dwn.processMessage`, and
+  streamed (`ReadableStream`) payloads always use HTTP.
 
 ## References
 
@@ -1164,17 +1205,16 @@ a starting point for other clients.
 [JSON-RPC 2.0 Specification](https://www.jsonrpc.org/specification)
 ~ JSON-RPC Working Group. March 2010.
 
-[[spec:RFC2119]]
-~ [Key words for use in RFCs to Indicate Requirement Levels](https://datatracker.ietf.org/doc/html/rfc2119). S. Bradner. March 1997.
+[[spec]]
 
-[[spec:RFC4648]]
-~ [The Base16, Base32, and Base64 Data Encodings](https://datatracker.ietf.org/doc/html/rfc4648). S. Josefsson. October 2006.
+[RFC 4648 — The Base16, Base32, and Base64 Data Encodings](https://datatracker.ietf.org/doc/html/rfc4648)
+~ S. Josefsson. October 2006.
 
-[[spec:RFC6455]]
-~ [The WebSocket Protocol](https://datatracker.ietf.org/doc/html/rfc6455). I. Fette, A. Melnikov. December 2011.
+[RFC 6455 — The WebSocket Protocol](https://datatracker.ietf.org/doc/html/rfc6455)
+~ I. Fette, A. Melnikov. December 2011.
 
-[[spec:RFC8259]]
-~ [The JavaScript Object Notation (JSON) Data Interchange Format](https://datatracker.ietf.org/doc/html/rfc8259). T. Bray. December 2017.
+[RFC 8259 — The JavaScript Object Notation (JSON) Data Interchange Format](https://datatracker.ietf.org/doc/html/rfc8259)
+~ T. Bray. December 2017.
 
 [RFC 9110 — HTTP Semantics](https://datatracker.ietf.org/doc/html/rfc9110)
 ~ R. Fielding, M. Nottingham, J. Reschke. June 2022.
