@@ -5,7 +5,7 @@ DWN Transport Protocol
 **Specification Status:** Draft
 
 **Latest Draft:**
-  TBD
+  https://dwn-transport-spec.pages.dev
 <!-- -->
 
 **Editors:**
@@ -20,20 +20,20 @@ DWN Transport Protocol
 
 ## Abstract
 
-The [Decentralized Web Node (DWN) specification](https://github.com/enboxorg/dwn-spec) defines message interfaces, module definitions, authorization, encryption, and durable-feed synchronization for personal data storage nodes — but intentionally omits how those messages are exchanged between parties over the network or on the local host.
+The [Decentralized Web Node (DWN) specification](https://dwn-spec.pages.dev) defines core message interfaces, module definitions, authorization, and encryption for personal data storage nodes — while leaving network transport, synchronization, and wallet connection protocols to companion specifications.
 
-This specification fills that gap. It defines the transport protocols, wire formats, and server behaviors that clients, servers, wallets, and agents ****MUST**** implement to interoperate when communicating with [[ref:Decentralized Web Nodes]].
+This specification defines the network and loopback transport layer that clients, servers, wallets, and agents ****MUST**** implement to interoperate when communicating with [[ref:Decentralized Web Nodes]].
 
 Specifically, this specification covers:
 
-- **Service endpoint discovery** from DID documents
+- **Service endpoint discovery** from DID documents, plus optional server-side forwarding and `$delivery` routing
 - **JSON-RPC 2.0 wire format** for `dwn.processMessage`, `dwn.applyReplicatedMessage`, subscriptions, flow control, and application-level keepalive (`rpc.ping`)
 - **HTTP transport** using single-body binary framing (`application/vnd.enbox.dwn-rpc`)
 - **WebSocket transport** for real-time subscriptions, sliding-window backpressure, pooled RPC routing, and dual-layer liveness
 - **REST convenience API** for simple, unauthenticated resource access
 - **Server information and capability discovery** (`/info`, `/health`)
 - **Tenant registration** (Proof-of-Work, Terms of Service, and `provider-auth-v0`)
-- **Sync orchestration** over durable message feeds and `dwn.applyReplicatedMessage`
+- **Sync transport binding** over HTTP/WebSocket for the companion [DWN Sync Protocol](https://dwn-sync-spec.pages.dev)
 - **Local Transport** (opt-in Local Node Profile, loopback pairing, origin-bound tokens, and passive discovery)
 
 ## Status of This Document
@@ -90,7 +90,7 @@ a DWN message or control request for transport over HTTP or WebSocket.
 ~ A long-lived stream over WebSocket where the server pushes real-time events to
 the client in response to a `RecordsSubscribe` or `MessagesSubscribe` message.
 Messages are delivered as [[ref:SubscriptionMessage]] objects. See
-[Subscription Events](#ws-subscription-events).
+[Subscription Events](#subscription-events).
 
 [[def:SubscriptionMessage]]
 ~ A 3-way discriminated union delivered over a [[ref:Subscription]]. Each
@@ -134,9 +134,9 @@ CLI bearer tokens.
 `~/.enbox/dwn.json` (with `0o600` permissions) advertising its loopback
 `endpoint`, `pid`, `capabilities`, and optional `localNodeToken`.
 
-## Service Endpoint Discovery {#service-endpoint-discovery}
+## Service Endpoint Discovery
 
-### DID Document Service Entry {#did-document-service-entry}
+### DID Document Service Entry
 
 A [[ref:DWN Client]] discovers the network location of a DID's [[ref:Decentralized Web Node]]
 by resolving the DID and inspecting the DID document for a service entry of type
@@ -178,7 +178,7 @@ non-string endpoint entries as `service-malformed`. Recursive
 DID-as-service-endpoint resolution is not implemented.
 :::
 
-### Endpoint URL Requirements {#endpoint-url-requirements}
+### Endpoint URL Requirements
 
 - [[ref:Service Endpoint]] URLs ****MUST**** use the `https:` or `http:` scheme
   (production remote endpoints ****SHOULD**** use `https:`).
@@ -192,7 +192,7 @@ DID-as-service-endpoint resolution is not implemented.
   prefix require a reverse proxy to strip the prefix before forwarding to
   `dwn-server`.
 
-### Multi-Endpoint Resolution {#multi-endpoint-resolution}
+### Multi-Endpoint Resolution
 
 When a DID document contains multiple [[ref:Service Endpoint]] URLs:
 
@@ -201,18 +201,21 @@ When a DID document contains multiple [[ref:Service Endpoint]] URLs:
 - Sync agents maintain independent replication links per
   `(tenant DID, remote endpoint, projection ID, authorization epoch)` across
   endpoints so all configured replicas converge.
-- DWN servers with forwarding or delivery enabled (`DeliveryService`) ****MAY****
-  proactively forward `RecordsWrite`/`RecordsDelete` messages to the tenant's
-  peer endpoints (excluding self) and deliver `$delivery: "direct"`
-  `RecordsWrite` messages to participant endpoints over HTTP
-  `dwn.processMessage`.
+### Server-Side Forwarding and Record Delivery
 
-## JSON-RPC 2.0 Wire Format {#json-rpc-wire-format}
+`dwn-server` provides an optional fire-and-forget post-processing hook (`DeliveryService`) supporting two latency optimizations over HTTP `dwn.processMessage` (triggered on `202` replies from `dwn.processMessage` and non-`204` `Applied` replies from `dwn.applyReplicatedMessage`):
+
+1. **Peer Endpoint Forwarding (`forwardingEnabled`)**: After processing (`202 Accepted`) a `RecordsWrite` or `RecordsDelete` for a tenant, the server resolves the tenant's other DWN service endpoints (cached with 300s TTL, excluding its own base URL, prioritizing full endpoints ahead of `cache` endpoints) and forwards the **original unmodified signed message** (plus stored data stream when `dataSize > 0`) via HTTP `dwn.processMessage`.
+2. **Direct Record Delivery (`deliveryEnabled`, `$delivery: "direct"`)**: After processing (`202`) a `RecordsWrite` at a module path declaring `$delivery: "direct"`, the server resolves participant DIDs (explicit `recipient`, role holders, and ancestor actors) and forwards the original signed message (and data) to their DWN endpoints. (`$delivery: "subscribe"` is accepted in module schemas as a hint; server-side subscribe delivery is not implemented.)
+
+Both forwarding and delivery use bounded retries (up to 2 retries at `1s` and `5s`, `10s` per-request timeout), treat `409` responses as idempotent success, maintain a short-lived mode-prefixed deduplication cache (`fwd:${tenant}:${id}` / `dlv:${targetDid}:${id}`, default 60s TTL, keyed on top-level `recordId`) to avoid loops, and never replace authoritative synchronization defined in the [DWN Sync Protocol](https://dwn-sync-spec.pages.dev). Transparent server-side read proxying to peer endpoints is not implemented (missing local record data returns `410`).
+
+## JSON-RPC 2.0 Wire Format
 
 All DWN messages sent between [[ref:DWN Clients]] and [[ref:DWN Servers]] are
 wrapped in [JSON-RPC 2.0](https://www.jsonrpc.org/specification) envelopes.
 
-### Request Object {#request-object}
+### Request Object
 
 ```json
 {
@@ -235,7 +238,7 @@ wrapped in [JSON-RPC 2.0](https://www.jsonrpc.org/specification) envelopes.
 - `subscription` — Required on `rpc.subscribe.dwn.processMessage`,
   `rpc.subscribe.close`, and `rpc.ack`: `{ "id": "<subscription-id>" }`.
 
-### Response Object {#response-object}
+### Response Object
 
 #### Success Response
 
@@ -276,7 +279,7 @@ For `dwn.applyReplicatedMessage` (note the key is `result.result`, not `result.r
 When a `dwn.processMessage` reply includes a data stream (`RecordsRead` or
 `MessagesRead` with data) over HTTP, the `entry.data` field is **deleted** from
 the JSON envelope and transmitted as the HTTP response body alongside the
-`dwn-response` header (see [HTTP Response Format](#http-response-format)).
+`dwn-response` header (see [Response Format](#response-format)).
 :::
 
 #### Error Response
@@ -293,7 +296,7 @@ the JSON envelope and transmitted as the HTTP response body alongside the
 }
 ```
 
-### Error Codes {#error-codes}
+### Error Codes
 
 Implementations use the following `JsonRpcErrorCodes`:
 
@@ -325,7 +328,7 @@ exceeded code (`TenantMessageQuotaExceeded` or `TenantStorageQuotaExceeded`) —
 or when `error.message` includes either quota error code substring — which sync
 agents handle as retryable quota blocks.
 
-### Methods {#methods}
+### Methods
 
 | Method | Transport | Description |
 |---|---|---|
@@ -336,7 +339,7 @@ agents handle as retryable quota blocks.
 | `rpc.ack` | WebSocket only | Acknowledge receipt of subscription messages (sliding-window flow control) |
 | `rpc.ping` | WebSocket (router accepts any) | Application-level liveness ping |
 
-#### `dwn.processMessage` {#method-process-message}
+#### `dwn.processMessage`
 
 Processes a single DWN message against the target tenant's node.
 
@@ -346,7 +349,7 @@ Processes a single DWN message against the target tenant's node.
 
 **Result:** `{ "reply": <DwnMessageReply> }`.
 
-#### `dwn.applyReplicatedMessage` {#method-apply-replicated-message}
+#### `dwn.applyReplicatedMessage`
 
 Admits a replicated message through `Dwn.applyReplicatedMessage` and returns a
 structured `ReplicationApplyResult`.
@@ -375,7 +378,7 @@ structured `ReplicationApplyResult`.
 - `"Invalid"` (`{ kind: "Invalid", reason: string }`)
 - `"Deferred"` (`{ kind: "Deferred", reason: "record-data-unavailable" | "resolver-unavailable" | "storage" | "tenant-inactive" }`)
 
-#### `rpc.subscribe.dwn.processMessage` {#method-subscribe}
+#### `rpc.subscribe.dwn.processMessage`
 
 Opens a real-time subscription on a WebSocket connection.
 
@@ -383,7 +386,7 @@ Opens a real-time subscription on a WebSocket connection.
 **Subscription:** `{ "id": "<client-assigned-id>" }` (duplicate IDs on the same connection return `-32602`).
 **Result:** `{ "reply": <SubscribeReply> }` (including `entries` + pagination `cursor` for `RecordsSubscribe` snapshot mode, or `head` + `fingerprint` / `roleRecordId` for `MessagesSubscribe`).
 
-#### `rpc.subscribe.close` {#method-subscribe-close}
+#### `rpc.subscribe.close`
 
 Closes an active subscription on the current WebSocket connection.
 
@@ -391,7 +394,7 @@ Closes an active subscription on the current WebSocket connection.
 **Subscription:** `{ "id": "<subscription-id>" }` (missing `subscription` returns `-32600`; unknown `id` returns `-32602`).
 **Result:** `{ "reply": { "status": 200, "detail": "Accepted" } }`.
 
-#### `rpc.ack` {#method-rpc-ack}
+#### `rpc.ack`
 
 Acknowledges receipt and processing of subscription messages for sliding-window
 flow control.
@@ -400,25 +403,25 @@ flow control.
 **Subscription:** `{ "id": "<subscription-id>" }` (missing `subscription` returns `-32602`).
 **Result:** The server responds with `{ "reply": { "status": 200, "detail": "OK" } }` (inventing a UUID `id` if the request omitted `id`).
 
-#### `rpc.ping` {#method-rpc-ping}
+#### `rpc.ping`
 
 Application-level keepalive and on-demand connection health probe.
 
 **Request:** `{ "jsonrpc": "2.0", "id": "<id>", "method": "rpc.ping" }` (no `params`).
 **Result:** `{ "ok": true }`.
 
-## HTTP Transport {#http-transport}
+## HTTP Transport
 
 The HTTP transport is used for request-response DWN message processing and
 replicated apply, including arbitrarily large streaming binary payloads.
 
-### Endpoint {#http-endpoint}
+### Endpoint
 
 All JSON-RPC HTTP requests are sent via HTTP `POST` to the base
 [[ref:Service Endpoint]] URL (`POST /`). A `GET /` request returns a `200 OK`
 `text/plain` server banner.
 
-### Request Format {#http-request-format}
+### Request Format
 
 DWN HTTP requests use a **single binary-framed request body** with media type
 `application/vnd.enbox.dwn-rpc`. The legacy `dwn-request` HTTP header is **not**
@@ -465,9 +468,9 @@ When connecting to a Local Node Profile endpoint (or any endpoint configured
 with a bearer token), clients attach `Authorization: Bearer <token>` on HTTP
 requests (`rpc-auth.ts`).
 
-### Response Format {#http-response-format}
+### Response Format
 
-#### Response with Data Stream {#response-with-data}
+#### Response with Data Stream
 
 When the DWN reply includes a data stream (`RecordsRead` or `MessagesRead` with data):
 
@@ -485,14 +488,14 @@ dwn-response: {"jsonrpc":"2.0","id":"abc-789","result":{"reply":{"status":{"code
 ```
 :::
 
-#### Response without Data Stream {#response-without-data}
+#### Response without Data Stream
 
 For all other replies (queries, writes, deletes, module operations, replicated apply, etc.):
 
 - The HTTP response body ****MUST**** contain `JSON.stringify(jsonRpcResponse)`.
 - The `Content-Type` header ****MUST**** be `application/json`.
 
-#### Error Responses {#http-error-responses}
+#### Error Responses
 
 - **Framing / `Content-Type` / UTF-8 / invalid JSON envelope errors**: HTTP `400` with a JSON-RPC error response carrying code **`-50400`** (`BadRequest`). (Note: in current `dwn-server`, a valid non-object JSON value such as `null` passes JSON parsing and fails during routing with plain-text HTTP `500`.)
 - **Per-IP rate limit exceeded**: HTTP `429 Too Many Requests` with `Retry-After` header and plain JSON body `{"error":"Rate limit exceeded"}`.
@@ -505,7 +508,7 @@ For all other replies (queries, writes, deletes, module operations, replicated a
 
 `HttpDwnRpcClient` applies default request timeouts of **30 seconds** (extended to **300 seconds** for `dwn.applyReplicatedMessage` whenever `message.descriptor.dataSize > 1_048_576`, including bodyless `ancestryOnly` writes) and retries transient network errors (`TypeError`) and HTTP `408`, `429`, `500`, `502`, `503`, `504` up to 3 times using jittered exponential backoff (`500ms` to `10s`, respecting `Retry-After` capped at `10s`), skipping retries on HTTP `500` responses containing a terminal JSON-RPC error and never retrying non-replayable `ReadableStream` bodies. `DwnServerInfoCacheMemory` caches `GET /info` responses for **15 minutes** by default.
 
-### CORS {#cors}
+### CORS
 
 On public (non-local-node) deployments, servers return the following CORS
 headers on all routes except `/admin*` and `/metrics` (including DWN `/`, REST,
@@ -529,7 +532,7 @@ only for `/info`, `/local/pair`, matching-origin `/local/pair/:requestId`, or
 already-paired origins, and `Access-Control-Allow-Headers` is narrowed to
 `authorization, content-type`.
 
-### Method Restrictions {#http-method-restrictions}
+### Method Restrictions
 
 All non-subscribe DWN methods (`dwn.processMessage` and
 `dwn.applyReplicatedMessage`) are supported over HTTP. HTTP is required for
@@ -540,14 +543,14 @@ and `dwn.applyReplicatedMessage` with `includeMaterializationConfirmation: true`
 `rpc.subscribe.dwn.processMessage` with a non-subscribe message is executed by
 the router over HTTP.)
 
-## WebSocket Transport {#websocket-transport}
+## WebSocket Transport
 
 The WebSocket transport provides real-time subscriptions (`RecordsSubscribe`,
 `MessagesSubscribe`), sliding-window backpressure, dual-layer liveness, and
 pooled low-latency routing for eligible control-plane and small/ancestry-only
 replicated-apply RPCs.
 
-### Connection Establishment {#ws-connection}
+### Connection Establishment
 
 Clients upgrade at the base [[ref:Service Endpoint]] URL (`GET /` with
 `Upgrade: websocket`; note that `dwn-server` accepts WebSocket upgrades on any
@@ -563,7 +566,7 @@ authenticate via `Authorization: Bearer <token>` OR query parameter
 `?localNodeToken=<token>` (alongside strict `Origin` binding). Clients redact
 query parameters and credentials from connection error messages.
 
-### Message Framing and Payload Limits {#ws-framing}
+### Message Framing and Payload Limits
 
 Each WebSocket message carries a single JSON-serialized `JsonRpcRequest`
 (client → server) or `JsonRpcResponse` (server → client). Batching is not
@@ -573,7 +576,7 @@ supported.
 - **Client pooled-socket opportunistic routing cap**: `WS_JSON_RPC_ENVELOPE_BYTES = 65_536` (**64 KiB total UTF-8 JSON-RPC frame**, including both envelope metadata and base64url-encoded `params.encodedData` — roughly 47–48 KiB of raw record bytes).
 - **Invalid JSON / empty frame**: Returns a JSON-RPC error with code **`-50400`** (`BadRequest`) and a server-generated UUID `id`.
 
-### Request-Response Correlation {#ws-correlation}
+### Request-Response Correlation
 
 Requests and responses are correlated by JSON-RPC `id`. Subscription pushes
 carry the client-assigned `subscription.id` as the JSON-RPC response `id`.
@@ -582,12 +585,12 @@ response `id` to `message.recordId ?? crypto.randomUUID()` rather than the
 incoming JSON-RPC `id`, so quota errors over WebSocket do not correlate with
 pending request IDs.)
 
-### Subscriptions {#ws-subscriptions}
+### Subscriptions
 
 WebSocket is the ****only**** transport supporting `RecordsSubscribe` and
 `MessagesSubscribe`.
 
-#### Opening a Subscription {#ws-open-subscription}
+#### Opening a Subscription
 
 The client sends `rpc.subscribe.dwn.processMessage` with `subscription: { id }`:
 
@@ -619,12 +622,12 @@ The client sends `rpc.subscribe.dwn.processMessage` with `subscription: { id }`:
   - `MessagesSubscribe` (owner/delegate): reply includes `head` (current log head, or empty-log anchor `{ streamId, epoch, position: "0" }` omitting `messageCid`) and optional canonical-scope `fingerprint`, captured after the live listener is registered. Role-authorized `MessagesSubscribe` replies omit `head`/`fingerprint` and include `roleRecordId`.
 - **`ProgressGap` (`410`)**: If `cursor` is no longer replayable, the DWN returns a JSON-RPC success response whose `result.reply` has `status: { code: 410, detail: "Progress token gap" }` and `error: { code: "ProgressGap", requested, oldestAvailable, latestAvailable, reason }` where `reason` is `"token_too_old" | "token_too_new" | "epoch_mismatch" | "stream_mismatch" | "message_mismatch"`.
 
-#### Subscription Events {#ws-subscription-events}
+#### Subscription Events
 
 Pushed frames set `id` to `subscription.id` and `result.subscription` to a
 3-way [[ref:SubscriptionMessage]] union:
 
-##### Event Messages (`type: "event"`) {#ws-event-messages}
+##### Event Messages (`type: "event"`)
 
 ```json
 {
@@ -664,7 +667,7 @@ Pushed frames set `id` to `subscription.id` and `result.subscription` to a
 | `encodedData` | `string` (optional) | Inline base64url data (`<= 30,000` bytes; detached from `event.message` and `event.initialWrite`, omitted in `metadataOnly` mode) |
 | `event` | `object` | `{ message, initialWrite? }` |
 
-##### EOSE (`type: "eose"`) {#ws-eose}
+##### EOSE (`type: "eose"`)
 
 Delivered in cursor mode after stored replay reaches the frozen catch-up
 high-water token (`bounds.latest`, or input `cursor` if the log is empty):
@@ -687,7 +690,7 @@ high-water token (`bounds.latest`, or input `cursor` if the log is empty):
 }
 ```
 
-##### Terminal Error Messages (`type: "error"`) {#ws-error-messages}
+##### Terminal Error Messages (`type: "error"`)
 
 Sent when the server terminates a subscription mid-stream (e.g., delivery-time
 grant/role revocation, mid-stream `ProgressGap`, `SubscriptionBufferOverflow`,
@@ -717,7 +720,7 @@ or `SubscriptionBufferTimeout`):
 
 Clients ****MUST NOT**** treat `cursor` on an error message as an applied checkpoint.
 
-#### Closing a Subscription {#ws-close-subscription}
+#### Closing a Subscription
 
 ```json
 {
@@ -732,7 +735,7 @@ Server stops delivery, cleans up resources, and replies
 `{ "reply": { "status": 200, "detail": "Accepted" } }`. Closing the WebSocket
 automatically closes all active subscriptions on that connection.
 
-#### Flow Control (Backpressure) {#ws-flow-control}
+#### Flow Control (Backpressure)
 
 The server maintains a per-subscription sliding window (`FlowController`) with:
 - **`maxInFlight`**: default `32` (advertised in `/info`).
@@ -771,7 +774,7 @@ acknowledged via `rpc.ack`:
 - `rpc.ack` is transport-layer flow control only; durable sync checkpoints are
   persisted separately by clients/agents after local admission.
 
-### Heartbeat and Wake Liveness {#ws-heartbeat}
+### Heartbeat and Wake Liveness
 
 Connections use **dual-layer liveness**:
 
@@ -793,7 +796,7 @@ Connections use **dual-layer liveness**:
    `SubscriptionError` with `code: "SubscriptionRecoveryFailed"` if automatic
    resubscription fails).
 
-### Method Restrictions and Pooled WebSocket Routing {#ws-method-restrictions}
+### Method Restrictions and Pooled WebSocket Routing
 
 | Operation | HTTP | WebSocket | Notes |
 |---|---|---|---|
@@ -805,7 +808,7 @@ Connections use **dual-layer liveness**:
 | `rpc.subscribe.dwn.processMessage` (`RecordsSubscribe`, `MessagesSubscribe`) | **No** | Yes | WebSocket only (returns `-32600` for Subscribe messages over HTTP). |
 | `rpc.subscribe.close`, `rpc.ack`, `rpc.ping` | No (`rpc.ping` accepted by router) | Yes | WebSocket control methods (`close` and `ack` return `-32600` over HTTP). |
 
-## REST Convenience API {#rest-api}
+## REST Convenience API
 
 [[ref:DWN Servers]] expose read-only REST endpoints that internally construct
 anonymous (unsigned) DWN messages for publicly readable records and published
@@ -816,7 +819,7 @@ HTTP `200` with the JSON `RecordsQueryReply`). Prototype-pollution query keys
 by REST query parsers. `dwn-server` does not emit `Cache-Control` or `ETag`
 headers on REST responses.
 
-### Record Read {#rest-record-read}
+### Record Read
 
 ```
 GET /:did/read/records/:id
@@ -832,7 +835,7 @@ GET /:did/records/:id
 - **404**: Returns HTTP `404` with the JSON `RecordsReadReply` body.
 - **Other status codes** (e.g., `410`): Returns that HTTP status with JSON reply.
 
-### Module Record Read {#rest-module-record-read}
+### Module Record Read
 
 ```
 GET /:did/read/modules/:module/*
@@ -841,9 +844,9 @@ GET /:did/read/modules/:module/*
 - `:module` — base64url-encoded module URI.
 - `*` — non-empty `modulePath` (empty path returns HTTP `400`).
 - Optional dot-notation query parameters (e.g., `filter.schema`, `filter.dataFormat`, `filter.tags.*`).
-- Queries matching records with `pagination.limit = 1` and `dateSort = publishedDescending`, then returns the `RecordsRead` response (same response format as [Record Read](#rest-record-read)).
+- Queries matching records with `pagination.limit = 1` and `dateSort = publishedDescending`, then returns the `RecordsRead` response (same response format as [Record Read](#record-read)).
 
-### Module Definition Read {#rest-module-definition-read}
+### Module Definition Read
 
 ```
 GET /:did/read/modules/:module
@@ -854,7 +857,7 @@ GET /:did/read/modules/:module
 - **200**: Body is `entries[0]` (the full `ModulesConfigure` message JSON).
 - **404**: Module not installed or not published (`401` mapped to empty `404`).
 
-### Module Query {#rest-module-query}
+### Module Query
 
 ```
 GET /:did/query/modules
@@ -863,7 +866,7 @@ GET /:did/query/modules
 - Issues anonymous `ModulesQuery` with no filter.
 - **200**: Body is JSON array `entries` of all published `ModulesConfigure` messages (`401` mapped to empty `404`).
 
-### Record Query {#rest-record-query}
+### Record Query
 
 ```
 GET /:did/query
@@ -902,9 +905,9 @@ GET /did:example:alice/query?filter.module=https://social.example/modules/feed&f
 - **400**: `{ "error": "Bad Request" }` on malformed parameters that fail
   `RecordsQuery.create` schema validation.
 
-## Server Information {#server-information}
+## Server Information
 
-### Info Endpoint {#info-endpoint}
+### Info Endpoint
 
 ```
 GET /info
@@ -955,7 +958,7 @@ GET /info
 }
 ```
 
-#### ServerInfo Object {#server-info-object}
+#### ServerInfo Object
 
 | Property | Type | Required | Description |
 |---|---|---|---|
@@ -971,7 +974,7 @@ GET /info
 | `localPairing` | `object` | Optional | Present when `localNode === true`: `{ pairUrl, pollUrlTemplate }` derived from `url` |
 | `providerAuth` | `object` | Conditional | Present whenever `"provider-auth-v0"` is in `registrationRequirements`: `{ authorizeUrl, tokenUrl, refreshUrl?, managementUrl? }` |
 
-### Health Endpoint {#health-endpoint}
+### Health Endpoint
 
 ```
 GET /health
@@ -979,7 +982,7 @@ GET /health
 
 Returns `200 OK`, `application/json`, `{"ok": true}`. (Protected by bearer auth when `localNodeProfileEnabled === true`.)
 
-## Tenant Registration {#tenant-registration}
+## Tenant Registration
 
 Multi-tenant [[ref:DWN Servers]] ****MAY**** require tenant registration before
 accepting DWN messages for a DID, advertising active requirements in
@@ -988,7 +991,7 @@ accepting DWN messages for a DID, advertising active requirements in
 when ToS is unset, or `/registration` when no registration store is configured)
 return HTTP `404 Not Found`.
 
-### Proof-of-Work Challenge {#pow-challenge}
+### Proof-of-Work Challenge
 
 ```
 GET /registration/proof-of-work
@@ -1008,7 +1011,7 @@ GET /registration/proof-of-work
 | `challengeNonce` | `string` | 64-character hex server challenge nonce rotating every 10 minutes. Accepts previous & current nonces (uppercase random hex); when `challengeSeed` (`DWN_REGISTRATION_PROOF_OF_WORK_SEED`) is configured, nonces are deterministic lowercase SHA-256 hex and a `nextChallengeNonce` window is also accepted. |
 | `maximumAllowedHashValue` | `string` | 64-character hex upper bound adjusted adaptively (target 10 solves/minute, reevaluated every 10 seconds) |
 
-#### Solving the Challenge {#solving-challenge}
+#### Solving the Challenge
 
 The client ****MUST**** find a **64-character hex** `responseNonce` (32 random
 bytes; non-reusable while present in the last-minute set, pruned on the 10-second
@@ -1026,7 +1029,7 @@ standard `JSON.stringify` (without JCS canonicalization) is used on both client
 and server, non-JavaScript clients ****MUST**** preserve the key order parsed
 from the submitted JSON (`did`, then `termsOfServiceHash`, with no whitespace).
 
-### Terms of Service {#terms-of-service}
+### Terms of Service
 
 ```
 GET /registration/terms-of-service
@@ -1035,7 +1038,7 @@ GET /registration/terms-of-service
 Returns the terms of service as `text/plain`. The client computes the lowercase
 hex SHA-256 hash of the text and passes it in `registrationData.termsOfServiceHash`.
 
-### Provider Authentication Registration (`provider-auth-v0`) {#provider-auth-registration}
+### Provider Authentication Registration (`provider-auth-v0`)
 
 When `provider-auth-v0` is advertised along with `ServerInfo.providerAuth`:
 
@@ -1072,7 +1075,7 @@ When `provider-auth-v0` is advertised along with `ServerInfo.providerAuth`:
    `OpenAuthHandler` routes (`/provider-auth/authorize`, `/provider-auth/token`,
    `/provider-auth/refresh`).
 
-### Registration Submission {#registration-submission}
+### Registration Submission
 
 ```
 POST /registration
@@ -1111,70 +1114,40 @@ Content-Type: application/json
   - **500**: `{ "success": false }` (malformed JSON bodies currently fail before
     the JSON error handler and return plain-text HTTP `500`)
 
-## Sync Orchestration {#sync-orchestration}
+## Sync Transport Binding
 
-Synchronization between DWN nodes uses durable ordered message feeds
-(`MessagesQuery`, `MessagesSubscribe`, `MessagesRead`), role-authorized context
-support (`RecordsRead` with `includeReplicationSupport: true`), and
-`dwn.applyReplicatedMessage`. (`MessagesSync` and Sparse Merkle Trees are not
-used.)
+Full synchronization semantics — including replication feed sequences, XOR
+fingerprints, `ReplicationApplyResult` / `DependencyRef` closures, sync scopes,
+followed contexts, reconciliation flows, fault tolerance, and `sync-next` — are
+defined in the companion [DWN Sync Protocol](https://dwn-sync-spec.pages.dev).
 
-### Replication Progress State {#sync-progress-state}
+At the transport layer, sync agents bind to this specification as follows:
 
-- Progress tracking uses source-local [[ref:Progress Token]] values valid only
-  within their `(streamId, epoch)` domain.
-- Position comparisons ****MUST**** be numeric (BigInt-safe) and only within the
-  same `(streamId, epoch)` domain.
-- Clients persist independent pull (remote → local) and push (local → remote)
-  checkpoints per replication link `(tenantDid, remoteEndpoint, projectionId, authorizationEpoch)`.
-- Servers keep only connection-local flow-control state in memory and never
-  store durable per-peer sync checkpoints.
+- **Durable feed queries and reads**: Sent via `dwn.processMessage` over HTTP
+  (`MessagesQuery`, `MessagesRead`, `RecordsRead` with
+  `includeReplicationSupport: true`), or opportunistically over pooled WebSockets
+  for eligible control-plane queries `<= 64 KiB`.
+- **Replicated admission (`dwn.applyReplicatedMessage`)**:
+  - Streaming/large writes use HTTP `application/vnd.enbox.dwn-rpc` binary
+    framing (`300s` default client timeout when `descriptor.dataSize > 1 MiB`).
+  - Zero-data writes, `ancestryOnly: true` writes, and small inline
+    `params.encodedData` writes whose complete UTF-8 JSON-RPC frame is
+    `<= 64 KiB` may be opportunistically routed over an already-connected pooled
+    WebSocket.
+  - `includeMaterializationConfirmation: true` ****MUST**** use HTTP
+    authenticated via the Local Node Profile.
+  - Remote quota rejections return JSON-RPC `-32600` with structured
+    `TenantMessageQuotaExceeded` / `TenantStorageQuotaExceeded` data.
+- **Cursorless live subscriptions**: Sync agents open and reconnect live
+  `MessagesSubscribe` streams **cursorless** over WebSocket (gating `rpc.ack`
+  on local admission completion) and trigger durable pull/push reconciliation
+  passes on reconnect rather than relying on cursor-mode WS catch-up replay.
+- **Stateless servers**: Servers maintain only connection-local flow-control
+  state in memory and never persist per-peer sync checkpoints.
 
-### Authorization and Scopes {#sync-authorization}
+## Local Transport (Local Node Profile)
 
-- **Owner / Delegate bidirectional sync**: Uses unified **`Messages` / `Read`**
-  permission grants covering `MessagesQuery`, `MessagesSubscribe`, and
-  `MessagesRead` for either `full` (`filters: []`) or `moduleSet`
-  (`{ module: uri }` per module) scopes.
-- **Role-authorized pull-only context sync**: Uses `moduleRole` with exact
-  `Records` filters (`{ interface: "Records", module, modulePath, contextIdPrefix }`)
-  for `context` scopes, bootstrapping closure and encryption control via
-  `RecordsRead` with `includeReplicationSupport: true`.
-
-### Pull, Push, and Live Flows {#sync-flows}
-
-1. **Startup paired snapshot baseline (owner/delegate)**: Open cursorless
-   `MessagesSubscribe` on both remote and local DWNs; if their reply
-   `{ head, fingerprint }` snapshots match with valid heads, commit both
-   checkpoints immediately without paging `MessagesQuery`.
-2. **Pull (remote → local)**: Page `MessagesQuery` (default `limit: 100`) from
-   the pull checkpoint; dynamically toggle `cidsOnly` based on missing CIDs;
-   fetch missing large payloads or missing `DependencyRef`s via `MessagesRead`
-   (or `RecordsRead` with `includeReplicationSupport` for role links); order
-   closures topologically (up to 128 passes) and admit locally via
-   `Dwn.applyReplicatedMessage` (optionally with
-   `includeMaterializationConfirmation: true` over local-node HTTP).
-3. **Push (local → remote)**: Page local `MessagesQuery` from the push
-   checkpoint and send entries via **`dwn.applyReplicatedMessage`** over HTTP
-   framed bodies (or over pooled WebSockets for zero-data, `ancestryOnly: true`,
-   or small inline `params.encodedData` writes whose complete UTF-8 JSON-RPC
-   frame is `<= 64 KiB`). Remote DWN is the dependency authority:
-   `Incomplete { missing }` triggers fetching missing local dependencies and
-   retrying; quota rejections (`-32600` with `TenantMessageQuotaExceeded` /
-   `TenantStorageQuotaExceeded`) create backed-off quota blocks rather than dead
-   letters.
-4. **Live updates & periodic settle checks**: Sync opens and reconnects live
-   `MessagesSubscribe` streams **cursorless** (never relying on cursor-mode WS
-   catch-up replay; instead scheduling durable pull/push reconciliation passes
-   on reconnect to close any gap). Complete remote live socket events are
-   admitted in order, gating `rpc.ack` on handler completion; local live writes
-   coalesce a push pass from the push checkpoint; periodic settle checks run
-   every **5 minutes** by default (`"5m"`), probing fingerprints first
-   (`cidsOnly: true, limit: 1`) before reconciling.
-
-## Local Transport (Local Node Profile) {#local-transport}
-
-### Overview {#local-transport-overview}
+### Overview
 
 `dwn-server` and `@enbox/local-node` provide an opt-in **Local Node Profile**
 (`localNodeProfileEnabled: true` / `DWN_LOCAL_NODE_PROFILE=true`) for on-device
@@ -1187,7 +1160,7 @@ with loopback isolation and origin-bound pairing authentication. `@enbox/local-n
 inherits default `dwn-server` rate limits as well as `forwardingEnabled: true`
 and `deliveryEnabled: true`.
 
-### Loopback Isolation and Anti-DNS-Rebinding {#local-loopback}
+### Loopback Isolation and Anti-DNS-Rebinding
 
 When `localNodeProfileEnabled` is enabled:
 - **Bind enforcement**: The server defaults `hostname` to `127.0.0.1` and
@@ -1207,7 +1180,7 @@ When `localNodeProfileEnabled` is enabled:
   `/admin*`, and `/metrics` — require valid local-node authentication (HTTP
   `401` `{"error":"Unauthorized"}` otherwise).
 
-### Pairing and Session Authentication {#local-pairing}
+### Pairing and Session Authentication
 
 Tokens are 32 random bytes encoded as base64url and verified with constant-time
 comparison (`timingSafeEqual`):
@@ -1257,9 +1230,9 @@ comparison (`timingSafeEqual`):
 - `dwn.applyReplicatedMessage` permits `includeMaterializationConfirmation: true`
   only over HTTP on authenticated Local Node Profile connections.
 
-### Local Discovery {#local-discovery}
+### Local Discovery
 
-#### Discovery File (`~/.enbox/dwn.json`) {#discovery-file}
+#### Discovery File (`~/.enbox/dwn.json`)
 
 `@enbox/local-node` listens on the first available port in `55500..55509, 3000`
 and writes `~/.enbox/dwn.json` (`0o600` permissions on POSIX platforms):
@@ -1280,7 +1253,7 @@ and writes `~/.enbox/dwn.json` (`0o600` permissions on POSIX platforms):
 | `capabilities` | `string[]` | No | Advertised transport capabilities (e.g., `["http", "ws"]`) |
 | `localNodeToken` | `string` | No | Origin-less bearer token for CLI/native callers |
 
-#### Passive Startup Discovery and User-Gesture Probing {#passive-discovery}
+#### Passive Startup Discovery and User-Gesture Probing
 
 - **CLI / native**: `LocalDwnDiscovery` reads `~/.enbox/dwn.json` and verifies
   `GET /info` reports `server === "@enbox/dwn-server"` (only `@enbox/local-node`
@@ -1303,15 +1276,15 @@ and writes `~/.enbox/dwn.json` (`0o600` permissions on POSIX platforms):
   `dwn-discovery-payload.ts` to loopback hostnames (`127.0.0.1`, `::1`,
   `localhost`, or `*.localhost`).
 
-## Security Considerations {#security-considerations}
+## Security Considerations
 
-### TLS Requirements {#tls-requirements}
+### TLS Requirements
 
 Remote [[ref:DWN Servers]] ****SHOULD**** be deployed behind TLS (`https://` and
 `wss://`). Loopback [[ref:Local Transport]] endpoints (`127.0.0.1`, `::1`,
 `localhost`) ****MAY**** use plaintext `http://` and `ws://`.
 
-### Rate Limiting and Tenant Quotas {#rate-limiting}
+### Rate Limiting and Tenant Quotas
 
 `dwn-server` enforces token-bucket rate limits at three levels:
 1. **Per-IP HTTP**: default `30 req/s`, burst `50` → HTTP `429`, `Retry-After`,
@@ -1327,7 +1300,7 @@ Per-tenant message-count and storage quotas (active when `adminStore` is
 configured via `adminToken`) return JSON-RPC `-32600` (`InvalidRequest`) with
 structured `data: { code: "TenantMessageQuotaExceeded" | "TenantStorageQuotaExceeded" }`.
 
-### Message Size Limits {#message-size-limits}
+### Message Size Limits
 
 - **HTTP RPC JSON envelope**: strictly capped at **1 MiB**
   (`HTTP_DWN_RPC_MAX_ENVELOPE_BYTES = 1_048_576`) by `http-dwn-rpc-framing.ts`.
@@ -1340,7 +1313,7 @@ structured `data: { code: "TenantMessageQuotaExceeded" | "TenantStorageQuotaExce
   HTTP stream capping to `descriptor.dataSize` is applied only in
   `dwn.applyReplicatedMessage` (not `dwn.processMessage`).
 
-### WebSocket, Header, and Input Hardening {#websocket-security}
+### WebSocket, Header, and Input Hardening
 
 - Servers enforce RFC 6455 `ping` timeouts (30s), `maxPayloadLength`, and
   per-subscription flow-control bounds (`maxInFlight: 32`, `MAX_BUFFER_SIZE: 1000`,
@@ -1356,7 +1329,7 @@ structured `data: { code: "TenantMessageQuotaExceeded" | "TenantStorageQuotaExce
   permissions (POSIX), single-use pairing token delivery, and immediate
   WebSocket closure upon token revocation.
 
-### Transport-Layer Privacy {#transport-privacy}
+### Transport-Layer Privacy
 
 ::: note
 TLS protects wire payloads in transit, but endpoint URLs (DNS/SNI), client IP
@@ -1370,10 +1343,13 @@ authorization and CID verification at the destination node.
 
 ## Normative References
 
-[DWN Specification](https://github.com/enboxorg/dwn-spec)
+[DWN Specification](https://dwn-spec.pages.dev)
 ~ Enbox Decentralized Web Node Specification.
 
-[Enbox Connect Protocol Specification](https://github.com/enboxorg/web5-connect-spec)
+[DWN Sync Protocol Specification](https://dwn-sync-spec.pages.dev)
+~ Enbox Decentralized Web Node Sync Protocol Specification.
+
+[Enbox Connect Protocol Specification](https://web5-connect-spec.pages.dev)
 ~ Enbox Connect Protocol (v2) Specification.
 
 [JSON-RPC 2.0 Specification](https://www.jsonrpc.org/specification)
