@@ -20,29 +20,36 @@ DWN Transport Protocol
 
 ## Abstract
 
-The [Decentralized Web Node (DWN) specification](https://github.com/enboxorg/dwn-spec) defines message interfaces, authorization, encryption, and synchronization for personal data storage nodes — but intentionally omits how those messages are exchanged between parties over the network.
+The [Decentralized Web Node (DWN) specification](https://github.com/enboxorg/dwn-spec) defines message interfaces, module definitions, authorization, encryption, and durable-feed synchronization for personal data storage nodes — but intentionally omits how those messages are exchanged between parties over the network or on the local host.
 
 This specification fills that gap. It defines the transport protocols, wire formats, and server behaviors that clients, servers, wallets, and agents ****MUST**** implement to interoperate when communicating with [[ref:Decentralized Web Nodes]].
 
 Specifically, this specification covers:
 
 - **Service endpoint discovery** from DID documents
-- **JSON-RPC 2.0 wire format** for encoding DWN messages over the network
-- **HTTP transport** for request-response message processing
-- **WebSocket transport** for real-time subscriptions and event streaming
+- **JSON-RPC 2.0 wire format** for `dwn.processMessage`, `dwn.applyReplicatedMessage`, subscriptions, flow control, and application-level keepalive (`rpc.ping`)
+- **HTTP transport** using single-body binary framing (`application/vnd.enbox.dwn-rpc`)
+- **WebSocket transport** for real-time subscriptions, sliding-window backpressure, pooled RPC routing, and dual-layer liveness
 - **REST convenience API** for simple, unauthenticated resource access
-- **Server information and capability discovery**
-- **Tenant registration** for multi-tenant DWN servers
-- **Per-message payment** for usage-based DWN server monetization
-- **Sync orchestration** between DWN nodes
-- **Local transports** for on-device inter-process communication between DWN clients and servers
+- **Server information and capability discovery** (`/info`, `/health`)
+- **Tenant registration** (Proof-of-Work, Terms of Service, and `provider-auth-v0`)
+- **Sync orchestration** over durable message feeds and `dwn.applyReplicatedMessage`
+- **Local Transport** (opt-in Local Node Profile, loopback pairing, origin-bound tokens, and passive discovery)
 
 ## Status of This Document
 
 DWN Transport Protocol is a _DRAFT_ specification under development by
 [Enbox](https://enbox.org). It is a companion specification to the
 [DWN specification](https://github.com/enboxorg/dwn-spec) and describes the
-transport layer referenced in that specification's Technical Stack.
+transport layer implemented in [enboxorg/enbox](https://github.com/enboxorg/enbox)
+(`@enbox/dwn-server`, `@enbox/dwn-clients`, `@enbox/local-node`, `@enbox/agent`,
+`@enbox/auth`, and `@enbox/dids`).
+
+Earlier draft sections covering per-message payment (`-50402`, `dwn-payment`,
+L402/Cashu/x402), Sparse Merkle Tree `MessagesSync`, DID challenge-response
+local auth, Bonjour/mDNS, iOS activation, Android AIDL, and browser extension
+bridges are not part of the current implementation and have been removed from
+this draft.
 
 The specification will be updated to incorporate feedback. We encourage reviewers
 to submit [GitHub Issues](https://github.com/enboxorg/dwn-transport-spec/issues)
@@ -50,77 +57,82 @@ as the means by which to communicate feedback and contributions.
 
 ## Terminology
 
-[[def:Decentralized Web Node, DWN, Node]]
+[[def:Decentralized Web Node, Decentralized Web Nodes, DWN, Node]]
 ~ A decentralized personal and application data storage and message relay node,
 as defined in the [DWN specification](https://github.com/enboxorg/dwn-spec).
 
-[[def:DWN Server]]
-~ A network-accessible service that hosts one or more [[ref:Decentralized Web Node]]
-instances and exposes them via the HTTP and WebSocket transports defined in this
-specification. A single DWN Server may serve multiple tenants.
+[[def:DWN Server, DWN Servers]]
+~ A network-accessible or loopback-bound service that hosts one or more
+[[ref:Decentralized Web Node]] instances and exposes them via the HTTP and
+WebSocket transports defined in this specification. A single DWN Server may
+serve multiple tenants.
 
-[[def:DWN Client]]
-~ Any software that sends DWN messages to a [[ref:DWN Server]] over the transports
-defined in this specification. Clients include user agents, mobile applications,
-other DWN Servers performing sync, and automated services.
+[[def:DWN Client, DWN Clients]]
+~ Any software that sends DWN messages to a [[ref:DWN Server]] over the
+transports defined in this specification. Clients include user agents, browser
+applications, CLI tools, other DWN Servers performing forwarding/delivery, and
+sync agents.
 
 [[def:Tenant]]
 ~ The DID that owns a [[ref:Decentralized Web Node]] instance. All messages sent
 to a DWN Server are scoped to a target tenant.
 
-[[def:Service Endpoint]]
+[[def:Service Endpoint, Service Endpoints]]
 ~ A URL published in a DID document that identifies the network location of a
 [[ref:DWN Server]] hosting a [[ref:Decentralized Web Node]] for that DID.
 
 [[def:JSON-RPC Envelope]]
-~ A JSON object conforming to the [JSON-RPC 2.0 specification](https://www.jsonrpc.org/specification)
-that wraps a DWN message for transport over HTTP or WebSocket.
+~ A JSON object conforming to the
+[JSON-RPC 2.0 specification](https://www.jsonrpc.org/specification) that wraps
+a DWN message or control request for transport over HTTP or WebSocket.
 
 [[def:Subscription]]
-~ A long-lived connection over WebSocket where the server pushes real-time events
-to the client in response to a `RecordsSubscribe` or `MessagesSubscribe` message.
-Events are delivered as `SubscriptionMessage` objects — a discriminated union of
-event payloads (with cursors) and End-of-Stored-Events (EOSE) markers. See
+~ A long-lived stream over WebSocket where the server pushes real-time events to
+the client in response to a `RecordsSubscribe` or `MessagesSubscribe` message.
+Messages are delivered as [[ref:SubscriptionMessage]] objects. See
 [Subscription Events](#ws-subscription-events).
 
 [[def:SubscriptionMessage]]
-~ A discriminated union delivered over a [[ref:Subscription]]. Each message has a
-`type` field: `"event"` for a regular event carrying a cursor and payload, or
-`"eose"` for an End-of-Stored-Events marker signaling that catch-up replay is
-complete.
+~ A 3-way discriminated union delivered over a [[ref:Subscription]]. Each
+message has a `type` field: `"event"` (carrying a progress token, payload, and
+optional feed metadata), `"eose"` (End-of-Stored-Events marker completing
+catch-up replay), or `"error"` (terminal subscription error closing the stream).
 
-[[def:Cursor]]
-~ An opaque string assigned by the server's EventLog implementation to each event.
-Clients persist cursors and pass them back when reconnecting to resume from the
-last seen position. Cursor format is implementation-defined and ****MUST NOT**** be
-parsed or constructed by clients.
+[[def:Progress Token]]
+~ A replay position object assigned by the server's durable replication feed /
+EventLog with the shape `{ streamId, epoch, position, messageCid? }`.
+`position` is a monotonic decimal string within `(streamId, epoch)`.
+`messageCid` is present when the token points to a specific delivered feed row,
+and is omitted for high-water cursors that produced no matching entry and for
+position-zero empty-log anchor tokens (`position: "0"`). Clients ****MUST NOT****
+synthesize or transform token fields. Position ordering comparisons
+****MUST**** be numeric (BigInt-safe), not lexicographic. Progress tokens are
+source-local resume artifacts and ****MUST NOT**** be reused across different
+remote providers or different logical streams.
 
-[[def:Payment Scheme]]
-~ A named protocol for fulfilling a payment obligation. Each scheme defines its own
-`PaymentRequirements` extensions and `PaymentProof` format. Scheme identifiers use
-URN format (`urn:enbox:payment:<scheme>:<version>`) for global uniqueness.
+[[def:Stream ID]]
+~ A stable identifier for the logical event stream domain issuing progress
+tokens (the first 8 bytes of `SHA-256(UTF-8(tenantDid))` as 16-character
+lowercase hex). It ****MUST**** remain stable across restarts, horizontal
+scaling, and failover, and ****MUST NOT**** include process-specific identifiers.
 
-[[def:Payment Handler]]
-~ A client-side component that can detect a supported [[ref:Payment Scheme]] in a
-`PaymentRequirements` object and produce a corresponding `PaymentProof`.
+[[def:Stream Epoch]]
+~ A generation identifier for a [[ref:Stream ID]]. Epoch changes when replay
+continuity cannot be guaranteed. Tokens from older epochs are invalid. Epoch
+values are equality-checked only and ****SHOULD**** be generated as UUID v4
+values.
 
 [[def:Local Transport]]
-~ A transport binding that enables [[ref:DWN Client]] to [[ref:DWN Server]]
-communication between processes on the same device, without traversing the
-public network. Local transports reuse the [JSON-RPC 2.0 wire format](#json-rpc-wire-format)
-but differ in their connection establishment, discovery, and authentication
-mechanisms.
+~ A loopback-bound HTTP and WebSocket transport profile (`Local Node Profile`)
+for on-device communication between a [[ref:DWN Client]] (browser app, CLI, or
+desktop app) and a local [[ref:DWN Server]] process, protected by loopback
+binding, `Host` header validation, origin-bound pairing tokens, and file-backed
+CLI bearer tokens.
 
 [[def:Discovery File]]
-~ A JSON file written by a local [[ref:DWN Server]] process to advertise its
-availability to [[ref:DWN Clients]] on the same device. The default location is
-`~/.enbox/dwn.json`.
-
-[[def:Extension Bridge]]
-~ A browser extension that acts as a [[ref:Local Transport]] between web
-application JavaScript and a native [[ref:DWN Server]] process on the same
-device. The extension relays [[ref:JSON-RPC Envelope]] messages across the
-boundary between browser and native execution contexts.
+~ A JSON file written by a local [[ref:DWN Server]] process at
+`~/.enbox/dwn.json` (with `0o600` permissions) advertising its loopback
+`endpoint`, `pid`, `capabilities`, and optional `localNodeToken`.
 
 ## Service Endpoint Discovery {#service-endpoint-discovery}
 
@@ -130,77 +142,77 @@ A [[ref:DWN Client]] discovers the network location of a DID's [[ref:Decentraliz
 by resolving the DID and inspecting the DID document for a service entry of type
 `DecentralizedWebNode`.
 
-The service entry ****MUST**** conform to the following requirements:
-
-- The `id` property ****MUST**** have a fragment value of `#dwn`.
 - The `type` property ****MUST**** be `"DecentralizedWebNode"`.
-- The `serviceEndpoint` property ****MUST**** be one of:
-  - A `string` value containing a single HTTPS URL.
-  - A map (JSON object) with a `url` property containing an HTTPS URL, and optional properties described below.
-  - An `array` of `string` values and/or maps as described above. Multiple endpoints indicate nodes that synchronize to the same state.
-
-When a `serviceEndpoint` entry is a map, the following properties are defined:
-
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `url` | `string` | Yes | The HTTPS URL of the DWN endpoint. |
-| `dataRetention` | `string` | No | `"cache"` when the node operates as a best-effort relay/cache. |
-
-When `dataRetention` is absent, or when the entry is a bare `string`, the endpoint is a full node. A bare string `"https://dwn.example.com"` is equivalent to `{ "url": "https://dwn.example.com" }`.
+- When publishing a service entry, implementations ****MUST**** set `id` to
+  `<did>#dwn` (or `#dwn` / `dwn`). Canonical DID endpoint resolution
+  (`@enbox/dids`) locates the DWN service exclusively by `id` matching
+  `<did>#dwn`, `#dwn`, or `dwn` (returning `service-missing` for any other `id`).
+- The `serviceEndpoint` property ****MUST**** be a single URL `string` or a
+  non-empty array of URL `string` values. Multiple endpoints indicate nodes that
+  synchronize to the same state.
 
 ::: example DID Document with DWN Service Entry
 ```json
 {
   "id": "did:example:alice",
   "service": [{
-    "id": "#dwn",
+    "id": "did:example:alice#dwn",
     "type": "DecentralizedWebNode",
     "serviceEndpoint": [
       "https://dwn.example.com",
-      { "url": "https://relay.example.com", "dataRetention": "cache" }
+      "https://dwn-backup.example.com"
     ]
   }]
 }
 ```
 :::
 
+::: note
+Server-side forwarding (`DeliveryService`) matches all services with
+`type === "DecentralizedWebNode"` regardless of `id`, and additionally tolerates
+endpoint map objects `{ "url": "<endpoint-url>", "dataRetention"?: "full" | "cache" }`
+either directly as `serviceEndpoint` or inside `serviceEndpoint` arrays so full
+endpoints can be prioritized ahead of cache endpoints during forwarding.
+Canonical client resolution (`@enbox/dids`) requires string URLs and reports
+non-string endpoint entries as `service-malformed`. Recursive
+DID-as-service-endpoint resolution is not implemented.
+:::
+
 ### Endpoint URL Requirements {#endpoint-url-requirements}
 
-- [[ref:Service Endpoint]] URLs ****MUST**** use the `https` scheme.
-- URLs ****MUST NOT**** include a trailing slash.
-- URLs ****MUST NOT**** include query parameters or fragment identifiers.
-- The URL represents the base path for all transport endpoints defined in this specification.
+- [[ref:Service Endpoint]] URLs ****MUST**** use the `https:` or `http:` scheme
+  (production remote endpoints ****SHOULD**** use `https:`).
+- URLs ****MUST NOT**** include query parameters (`?`) or fragment identifiers
+  (`#`).
+- Trailing `/` characters are stripped during normalization, and duplicate
+  normalized URLs are deduplicated.
+- The normalized URL represents the base path for all transport endpoints
+  defined in this specification. Note that `dwn-server` strictly matches
+  `path === "/"` for `POST` JSON-RPC requests; deployments advertising a path
+  prefix require a reverse proxy to strip the prefix before forwarding to
+  `dwn-server`.
 
 ### Multi-Endpoint Resolution {#multi-endpoint-resolution}
 
-When a DID document contains multiple [[ref:Service Endpoint]] URLs, a [[ref:DWN Client]]
-****SHOULD**** implement failover by attempting alternative endpoints when a request fails.
+When a DID document contains multiple [[ref:Service Endpoint]] URLs:
 
-Endpoints with no `dataRetention` property (including bare string entries) are full nodes and
-****SHOULD**** be treated as equivalent replicas. The client ****MAY**** select any full
-endpoint for a given request.
-
-Endpoints with `"dataRetention": "cache"` are best-effort relays. A client ****MAY**** send
-write operations to any endpoint (including cache endpoints). For read operations, clients
-****SHOULD**** prefer full endpoints when available, as cache endpoints may not retain all
-record data.
-
-For write operations (`RecordsWrite`, `RecordsDelete`, `ProtocolsConfigure`), a client
-****SHOULD**** send the message to at least one endpoint. The sync protocol ensures
-that all replicas converge to the same state.
-
-For sync operations, a client ****SHOULD**** choose a single endpoint to sync with.
-Since all endpoints serve the same tenant's DWN, syncing with one endpoint is sufficient.
+- Clients ****SHOULD**** implement failover by attempting alternative endpoints
+  when a request fails.
+- Sync agents maintain independent replication links per
+  `(tenant DID, remote endpoint, projection ID, authorization epoch)` across
+  endpoints so all configured replicas converge.
+- DWN servers with forwarding or delivery enabled (`DeliveryService`) ****MAY****
+  proactively forward `RecordsWrite`/`RecordsDelete` messages to the tenant's
+  peer endpoints (excluding self) and deliver `$delivery: "direct"`
+  `RecordsWrite` messages to participant endpoints over HTTP
+  `dwn.processMessage`.
 
 ## JSON-RPC 2.0 Wire Format {#json-rpc-wire-format}
 
-All DWN messages sent between [[ref:DWN Clients]] and [[ref:DWN Servers]] are wrapped
-in [JSON-RPC 2.0](https://www.jsonrpc.org/specification) envelopes. This provides a
-uniform request-response framing, error handling, and method dispatch.
+All DWN messages sent between [[ref:DWN Clients]] and [[ref:DWN Servers]] are
+wrapped in [JSON-RPC 2.0](https://www.jsonrpc.org/specification) envelopes.
 
 ### Request Object {#request-object}
-
-A JSON-RPC request ****MUST**** conform to the following structure:
 
 ```json
 {
@@ -215,24 +227,19 @@ A JSON-RPC request ****MUST**** conform to the following structure:
 ```
 
 - `jsonrpc` — ****MUST**** be `"2.0"`.
-- `id` — ****MUST**** be a `string`, `number`, or `null`. Used to correlate requests
-  with responses. Clients ****SHOULD**** use a UUID v4.
+- `id` — ****MAY**** be a `string`, `number`, or `null` (clients ****SHOULD****
+  use a UUID v4 on request-response calls).
 - `method` — ****MUST**** be one of the [registered methods](#methods).
-- `params` — ****MUST**** be an object containing:
-  - `target` — The DID of the [[ref:Tenant]] whose DWN should process the message.
-  - `message` — The DWN message object as defined in the
-    [DWN specification](https://github.com/enboxorg/dwn-spec).
-
-For subscription methods, the request ****MUST**** also include:
-
-- `subscription` — An object containing:
-  - `id` — A client-assigned identifier for the subscription. ****MUST**** be a
-    `string`, `number`, or `null`.
+- `params` — Method-specific parameters object (omitted for `rpc.ping`; for
+  `rpc.subscribe.close`, `JsonRpcSocket` sends `{}` and servers ignore `params`).
+- `subscription` — Required on `rpc.subscribe.dwn.processMessage`,
+  `rpc.subscribe.close`, and `rpc.ack`: `{ "id": "<subscription-id>" }`.
 
 ### Response Object {#response-object}
 
 #### Success Response
 
+For `dwn.processMessage` and `rpc.subscribe.dwn.processMessage`:
 ```json
 {
   "jsonrpc": "2.0",
@@ -246,17 +253,30 @@ For subscription methods, the request ****MUST**** also include:
 }
 ```
 
-- `id` — ****MUST**** match the `id` from the corresponding request.
-- `result` — An object containing:
-  - `reply` — The DWN reply object as defined in the
-    [DWN specification](https://github.com/enboxorg/dwn-spec). The exact shape
-    depends on the interface and method (see the DWN spec's
-    [Response Objects](https://github.com/enboxorg/dwn-spec) section).
+For `dwn.applyReplicatedMessage` (note the key is `result.result`, not `result.reply`):
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "b5e5c5a0-3e2a-4c1d-8f7e-1a2b3c4d5e6f",
+  "result": {
+    "result": {
+      "kind": "Applied",
+      "position": {
+        "streamId": "<stream-id>",
+        "epoch": "<stream-epoch>",
+        "position": "42",
+        "messageCid": "bafy..."
+      }
+    }
+  }
+}
+```
 
 ::: note
-When the DWN reply includes a data stream (e.g., `RecordsRead`), the `entry.data`
-field is **removed** from the JSON response and transmitted separately as described
-in [HTTP Response Format](#http-response-format). This applies only to the HTTP transport.
+When a `dwn.processMessage` reply includes a data stream (`RecordsRead` or
+`MessagesRead` with data) over HTTP, the `entry.data` field is **deleted** from
+the JSON envelope and transmitted as the HTTP response body alongside the
+`dwn-response` header (see [HTTP Response Format](#http-response-format)).
 :::
 
 #### Error Response
@@ -266,177 +286,192 @@ in [HTTP Response Format](#http-response-format). This applies only to the HTTP 
   "jsonrpc": "2.0",
   "id": "b5e5c5a0-3e2a-4c1d-8f7e-1a2b3c4d5e6f",
   "error": {
-    "code": -32603,
-    "message": "Internal error"
+    "code": -50429,
+    "message": "Too many requests",
+    "data": { "retryAfterSec": 5 }
   }
 }
 ```
 
-- `error` — An object containing:
-  - `code` — An integer error code. See [Error Codes](#error-codes).
-  - `message` — A human-readable error description.
-  - `data` — ****MAY**** be present with additional error context.
-
 ### Error Codes {#error-codes}
 
-Implementations ****MUST**** use the following error codes:
+Implementations use the following `JsonRpcErrorCodes`:
 
 | Code | Name | Description |
 |---|---|---|
-| `-32700` | Parse Error | Invalid JSON received by the server |
-| `-32600` | Invalid Request | The JSON is not a valid JSON-RPC request |
-| `-32601` | Method Not Found | The requested method does not exist |
-| `-32602` | Invalid Params | Invalid method parameters |
-| `-32603` | Internal Error | Internal server error |
-| `-32300` | Transport Error | Transport-level failure (e.g., stream interrupted) |
-| `-50400` | Bad Request | The DWN message was malformed or failed validation |
-| `-50401` | Unauthorized | Authentication or authorization failed |
-| `-50402` | Payment Required | The server requires payment to process this message. See [Per-Message Payment](#per-message-payment). |
-| `-50403` | Forbidden | The operation is not permitted for the given tenant |
-| `-50409` | Conflict | The message conflicts with existing state (e.g., duplicate) |
+| `-32700` | `ParseError` | Invalid JSON |
+| `-32600` | `InvalidRequest` | Invalid JSON-RPC request, missing `subscription` object on `rpc.subscribe.dwn.processMessage` or `rpc.subscribe.close`, or tenant quota exceeded (`data: { code: "TenantMessageQuotaExceeded" \| "TenantStorageQuotaExceeded" }`) |
+| `-32601` | `MethodNotFound` | Unknown JSON-RPC method |
+| `-32602` | `InvalidParams` | Invalid or missing method parameters, missing `subscription` object on `rpc.ack`, duplicate/unknown subscription ID, disallowed WS `RecordsWrite`, invalid `encodedData`, or `includeMaterializationConfirmation: true` over WebSocket |
+| `-32603` | `InternalError` | Unexpected internal server error |
+| `-32300` | `TransportError` | Client/transport-level failure |
+| `-50400` | `BadRequest` | Malformed HTTP RPC framing, missing/invalid JSON envelope, or invalid WebSocket JSON frame |
+| `-50401` | `Unauthorized` | Authentication or authorization failure |
+| `-50403` | `Forbidden` | Operation not permitted (e.g., `includeMaterializationConfirmation: true` without local-node authentication) |
+| `-50409` | `Conflict` | State conflict |
+| `-50429` | `TooManyRequests` | Per-tenant rate limit exceeded; includes `data: { retryAfterSec: number }` |
 
-Error codes in the `-32xxx` range are standard JSON-RPC errors. Codes in the
-`-50xxx` range are DWN-specific extensions that mirror HTTP status semantics.
+::: note
+`ProgressGap` (`410`) is a **DWN reply** status (`result.reply.status.code === 410`
+with `result.reply.error.code === "ProgressGap"`) returned inside a JSON-RPC
+**success** response (or mid-stream as a `SubscriptionMessage` with
+`type: "error"`), not a JSON-RPC error code.
+:::
+
+**Client Terminal vs. Retryable Classification (`DwnRpcError`):**
+Clients classify `-32600`, `-32602`, `-50400`, `-50401`, `-50403`, and `-50409`
+as terminal **except** when `code === -32600` carries a structured quota
+exceeded code (`TenantMessageQuotaExceeded` or `TenantStorageQuotaExceeded`) —
+or when `error.message` includes either quota error code substring — which sync
+agents handle as retryable quota blocks.
 
 ### Methods {#methods}
 
 | Method | Transport | Description |
 |---|---|---|
-| `dwn.processMessage` | HTTP, WebSocket | Process any DWN message |
-| `rpc.subscribe.dwn.processMessage` | WebSocket only | Open a subscription for a DWN subscribe message |
+| `dwn.processMessage` | HTTP, WebSocket | Process a single DWN message |
+| `dwn.applyReplicatedMessage` | HTTP, WebSocket | Admit a replicated message and return structured `ReplicationApplyResult` |
+| `rpc.subscribe.dwn.processMessage` | WebSocket only | Open a `RecordsSubscribe` or `MessagesSubscribe` subscription |
 | `rpc.subscribe.close` | WebSocket only | Close an active subscription |
-| `rpc.ack` | WebSocket only | Acknowledge receipt of subscription events (flow control) |
+| `rpc.ack` | WebSocket only | Acknowledge receipt of subscription messages (sliding-window flow control) |
+| `rpc.ping` | WebSocket (router accepts any) | Application-level liveness ping |
 
 #### `dwn.processMessage` {#method-process-message}
 
-Processes a single DWN message against the target tenant's node. This is the primary
-method for all DWN operations: writes, reads, queries, deletes, protocol configuration,
-and sync.
+Processes a single DWN message against the target tenant's node.
 
 **Parameters:**
+- `target` — Tenant DID.
+- `message` — DWN message object.
 
-- `target` — The DID of the tenant.
-- `message` — The DWN message object.
+**Result:** `{ "reply": <DwnMessageReply> }`.
 
-**Result:**
+#### `dwn.applyReplicatedMessage` {#method-apply-replicated-message}
 
-- `reply` — The DWN reply object. The shape varies by interface and method.
+Admits a replicated message through `Dwn.applyReplicatedMessage` and returns a
+structured `ReplicationApplyResult`.
+
+**Parameters:**
+```json
+{
+  "target": "did:example:alice",
+  "message": { ... },
+  "encodedData": "<optional-unpadded-base64url-for-ws>",
+  "ancestryOnly": true,
+  "includeMaterializationConfirmation": true
+}
+```
+- `target` — ****MUST**** be the tenant DID.
+- `message` — ****MUST**** be the DWN message object. Inline `message.encodedData` ****MUST NOT**** be present (rejected with `-32602`); callers carrying inline data over WebSocket ****MUST**** use `params.encodedData`, and HTTP callers carrying data ****MUST**** stream it in the framed HTTP body. (If a caller supplies both `params.encodedData` and an HTTP binary stream, `dwn-server` uses `params.encodedData` and cancels the HTTP stream.)
+- `encodedData` — ****MAY**** be present (typically over WebSocket). Strict unpadded base64url whose decoded byte length ****MUST**** equal `descriptor.dataSize` and ****MUST NOT**** exceed `maxRecordDataSize` (else `-32602`).
+- `ancestryOnly` — ****MAY**** be `true` (only boolean `true` is valid; `false` is rejected with `-32602`). Requires a data-less initial `RecordsWrite` (`RecordsWrite.isInitialWrite(message)` with a payload descriptor and no inbound data stream or `encodedData`). Permitted over both HTTP and WebSocket.
+- `includeMaterializationConfirmation` — ****MAY**** be a boolean. When `false`, it has no effect and is accepted on any transport. When `true`, it ****MUST**** be sent over HTTP (`transport === "http"`, else `-32602`) AND authenticated via the Local Node Profile (`isLocalNodeAuthenticated === true`, else `-50403` `Forbidden`); it requests `Duplicate.materialized: true` or `Superseded.currentWriteMaterialized: true` when local record data is positively observed. (Note: `Duplicate.materialized: true` is also returned without this flag whenever an exact duplicate `RecordsWrite` is replayed *with* inbound data; when `includeMaterializationConfirmation !== true`, proven-superseded writes short-circuit before quota enforcement and return `{ kind: "Superseded" }`.)
+
+**Result:** `{ "result": <ReplicationApplyResult> }` where `result.kind` is one of:
+- `"Applied"` (`{ kind: "Applied", ancestryOnly?: true, position?: ProgressToken }`)
+- `"Duplicate"` (`{ kind: "Duplicate", materialized?: true }`)
+- `"Superseded"` (`{ kind: "Superseded", currentWriteMaterialized?: true }`)
+- `"Incomplete"` (`{ kind: "Incomplete", missing: DependencyRef[] }` where `DependencyRef.type` is `"Module" | "InitialWrite" | "Parent" | "Ancestor" | "Role" | "Grant" | "EncryptionControl" | "RecordData"`)
+- `"Invalid"` (`{ kind: "Invalid", reason: string }`)
+- `"Deferred"` (`{ kind: "Deferred", reason: "record-data-unavailable" | "resolver-unavailable" | "storage" | "tenant-inactive" }`)
 
 #### `rpc.subscribe.dwn.processMessage` {#method-subscribe}
 
-Opens a real-time subscription on a WebSocket connection. The server processes the
-DWN subscribe message (e.g., `RecordsSubscribe` or `MessagesSubscribe`) and begins
-pushing matching events to the client.
+Opens a real-time subscription on a WebSocket connection.
 
-**Parameters:**
-
-- `target` — The DID of the tenant.
-- `message` — A DWN subscribe message (`RecordsSubscribe` or `MessagesSubscribe`).
-
-**Subscription:**
-
-- `id` — The client-assigned subscription identifier.
-
-**Result:**
-
-- `reply` — The DWN subscribe reply. If successful, subsequent events are pushed
-  as individual JSON-RPC responses with the subscription `id` as the response `id`
-  and `result.subscription` containing a [[ref:SubscriptionMessage]] — either an
-  event payload with a [[ref:Cursor]], or an EOSE marker. See
-  [Subscription Events](#ws-subscription-events).
+**Parameters:** `target` (tenant DID), `message` (`RecordsSubscribe` or `MessagesSubscribe`).
+**Subscription:** `{ "id": "<client-assigned-id>" }` (duplicate IDs on the same connection return `-32602`).
+**Result:** `{ "reply": <SubscribeReply> }` (including `entries` + pagination `cursor` for `RecordsSubscribe` snapshot mode, or `head` + `fingerprint` / `roleRecordId` for `MessagesSubscribe`).
 
 #### `rpc.subscribe.close` {#method-subscribe-close}
 
 Closes an active subscription on the current WebSocket connection.
 
-**Parameters:** None.
+**Parameters:** None (clients such as `JsonRpcSocket` may send `{}`; servers ignore `params`).
+**Subscription:** `{ "id": "<subscription-id>" }` (missing `subscription` returns `-32600`; unknown `id` returns `-32602`).
+**Result:** `{ "reply": { "status": 200, "detail": "Accepted" } }`.
 
-**Subscription:**
+#### `rpc.ack` {#method-rpc-ack}
 
-- `id` — The identifier of the subscription to close.
+Acknowledges receipt and processing of subscription messages for sliding-window
+flow control.
 
-**Result:**
+**Parameters:** `{ "cursor": <ProgressToken> }` (`messageCid` may be omitted or a non-empty string).
+**Subscription:** `{ "id": "<subscription-id>" }` (missing `subscription` returns `-32602`).
+**Result:** The server responds with `{ "reply": { "status": 200, "detail": "OK" } }` (inventing a UUID `id` if the request omitted `id`).
 
-- `reply` — `{ "status": { "code": 200, "detail": "OK" } }` on success.
-- If the subscription ID is not found, the server ****MUST**** return a
-  JSON-RPC error with code `-50400`.
+#### `rpc.ping` {#method-rpc-ping}
 
+Application-level keepalive and on-demand connection health probe.
+
+**Request:** `{ "jsonrpc": "2.0", "id": "<id>", "method": "rpc.ping" }` (no `params`).
+**Result:** `{ "ok": true }`.
 
 ## HTTP Transport {#http-transport}
 
-The HTTP transport is used for request-response DWN message processing. It supports
-all DWN interface methods, including data-bearing operations like `RecordsWrite` and
-`RecordsRead`.
+The HTTP transport is used for request-response DWN message processing and
+replicated apply, including arbitrarily large streaming binary payloads.
 
 ### Endpoint {#http-endpoint}
 
-All DWN messages are sent to the base [[ref:Service Endpoint]] URL via HTTP `POST`:
-
-```
-POST https://dwn.example.com/
-```
-
-The server ****MUST**** accept `POST` requests at the root path (`/`).
+All JSON-RPC HTTP requests are sent via HTTP `POST` to the base
+[[ref:Service Endpoint]] URL (`POST /`). A `GET /` request returns a `200 OK`
+`text/plain` server banner.
 
 ### Request Format {#http-request-format}
 
-DWN HTTP requests use a **header/body split** pattern that separates the JSON-RPC
-envelope from binary data:
+DWN HTTP requests use a **single binary-framed request body** with media type
+`application/vnd.enbox.dwn-rpc`. The legacy `dwn-request` HTTP header is **not**
+used and **not** accepted.
 
-- The `dwn-request` HTTP header ****MUST**** contain the JSON-serialized
-  [[ref:JSON-RPC Envelope]] (the full `JsonRpcRequest` object).
-- The HTTP request body ****MAY**** contain the raw binary data associated with
-  the message (e.g., record data for a `RecordsWrite`).
+#### Content-Type Requirement
 
-::: example RecordsWrite HTTP Request
+- `Content-Type` ****MUST**** be exact `application/vnd.enbox.dwn-rpc`
+  (case-insensitive after trimming whitespace; media-type `;` parameters are
+  rejected with HTTP `400` / `-50400`).
+
+#### Binary Body Wire Layout
+
+Every request body has the following exact binary layout:
+
+```
++---------------+---------------------------+-------------------------------+-------------------------+
+| Byte 0: flags | Bytes 1..4: uint32be len  | Bytes 5..(5+len-1): envelope  | Bytes (5+len)..EOF      |
+| (0x00 | 0x01) | (1 <= len <= 1,048,576)   | UTF-8 JSON-RPC request bytes  | Optional raw data stream|
++---------------+---------------------------+-------------------------------+-------------------------+
+```
+
+- **Byte 0 (`flags`)**:
+  - `0x00` — Envelope only; no trailing payload bytes should follow (any trailing bytes buffered in the same stream chunk as the envelope are rejected with HTTP `400` / `-50400`; the flag is authoritative and `http-dwn-rpc-framing.ts` cancels the reader without awaiting EOF once the envelope is read).
+  - `0x01` (`FRAME_DATA_FOLLOWS_FLAG`) — Raw binary record data stream follows immediately after the JSON envelope.
+  - Any other bit set is rejected with HTTP `400` / `-50400`.
+- **Bytes 1..4 (`envelopeLength`)**: Unsigned 32-bit big-endian integer (`uint32be`) giving the exact byte length of the JSON-RPC envelope. ****MUST**** satisfy `1 <= envelopeLength <= 1_048_576` (**1 MiB**, `HTTP_DWN_RPC_MAX_ENVELOPE_BYTES`; `envelopeLength === 0` fails JSON parsing and likewise returns HTTP `400` / `-50400`).
+- **Bytes 5..(5 + `envelopeLength` - 1)**: Strict UTF-8 encoded JSON-serialized `JsonRpcRequest` (`TextDecoder('utf-8', { fatal: true })`).
+- **Bytes (5 + `envelopeLength`)..EOF**: When `flags === 0x01`, the raw binary data stream (for `RecordsWrite` or data-bearing `dwn.applyReplicatedMessage`). Clients sending a streaming body set Fetch `duplex: "half"`.
+
+::: example Framed HTTP Request (Envelope + Binary Data)
 ```http
 POST / HTTP/1.1
 Host: dwn.example.com
-Content-Type: application/octet-stream
-dwn-request: {"jsonrpc":"2.0","id":"abc-123","method":"dwn.processMessage","params":{"target":"did:example:alice","message":{"descriptor":{"interface":"Records","method":"Write",...},"authorization":{...}}}}
+Content-Type: application/vnd.enbox.dwn-rpc
 
-<binary record data>
+<0x01><uint32be envelope length><UTF-8 {"jsonrpc":"2.0","id":"abc-123","method":"dwn.processMessage","params":{"target":"did:example:alice","message":{...}}}><raw binary record data>
 ```
 :::
 
-::: example RecordsQuery HTTP Request (no body)
-```http
-POST / HTTP/1.1
-Host: dwn.example.com
-Content-Length: 0
-dwn-request: {"jsonrpc":"2.0","id":"abc-456","method":"dwn.processMessage","params":{"target":"did:example:alice","message":{"descriptor":{"interface":"Records","method":"Query",...},"authorization":{...}}}}
-```
-:::
+#### Transport Authentication Header
 
-#### The `dwn-request` Header {#dwn-request-header}
-
-- The `dwn-request` header ****MUST**** be present on every `POST` request to the
-  DWN endpoint.
-- The value ****MUST**** be a JSON-serialized `JsonRpcRequest` object.
-- The server ****MUST**** return HTTP `400` if the header is missing or contains
-  invalid JSON.
-
-#### Request Body {#request-body}
-
-- For messages that include data (e.g., `RecordsWrite`), the binary data stream
-  ****MUST**** be sent as the HTTP request body.
-- The `Content-Type` header ****SHOULD**** be `application/octet-stream` for the
-  raw data body.
-- For messages without data, the body ****MUST**** be empty and `Content-Length`
-  ****SHOULD**** be `0`.
-- The server detects the presence of a body via the `Content-Length` header
-  (value > 0) or the presence of a `Transfer-Encoding` header.
+When connecting to a Local Node Profile endpoint (or any endpoint configured
+with a bearer token), clients attach `Authorization: Bearer <token>` on HTTP
+requests (`rpc-auth.ts`).
 
 ### Response Format {#http-response-format}
 
-The response format depends on whether the DWN reply includes a data stream.
-
 #### Response with Data Stream {#response-with-data}
 
-When the DWN reply includes a data stream (e.g., a `RecordsRead` reply with record data):
+When the DWN reply includes a data stream (`RecordsRead` or `MessagesRead` with data):
 
-- The `dwn-response` HTTP header ****MUST**** contain the JSON-serialized
-  `JsonRpcResponse` object, with the `entry.data` field **removed**.
+- The `dwn-response` HTTP header ****MUST**** contain `JSON.stringify(jsonRpcResponse)` with `entry.data` removed.
 - The HTTP response body ****MUST**** contain the raw binary data stream.
 - The `Content-Type` header ****MUST**** be `application/octet-stream`.
 
@@ -444,7 +479,7 @@ When the DWN reply includes a data stream (e.g., a `RecordsRead` reply with reco
 ```http
 HTTP/1.1 200 OK
 Content-Type: application/octet-stream
-dwn-response: {"jsonrpc":"2.0","id":"abc-789","result":{"reply":{"status":{"code":200,"detail":"OK"},"entry":{"recordsWrite":{"descriptor":{"interface":"Records","method":"Write","dataFormat":"image/png",...}}}}}}
+dwn-response: {"jsonrpc":"2.0","id":"abc-789","result":{"reply":{"status":{"code":200,"detail":"OK"},"entry":{"recordsWrite":{"recordId":"bafy...","contextId":"bafy...","descriptor":{"interface":"Records","method":"Write","dataFormat":"image/png",...},"authorization":{...}}}}}}
 
 <binary record data>
 ```
@@ -452,120 +487,109 @@ dwn-response: {"jsonrpc":"2.0","id":"abc-789","result":{"reply":{"status":{"code
 
 #### Response without Data Stream {#response-without-data}
 
-For all other replies (queries, writes, deletes, protocol operations, sync, etc.):
+For all other replies (queries, writes, deletes, module operations, replicated apply, etc.):
 
-- The HTTP response body ****MUST**** contain the JSON-serialized `JsonRpcResponse` object.
+- The HTTP response body ****MUST**** contain `JSON.stringify(jsonRpcResponse)`.
 - The `Content-Type` header ****MUST**** be `application/json`.
-
-::: example RecordsQuery HTTP Response
-```http
-HTTP/1.1 200 OK
-Content-Type: application/json
-
-{"jsonrpc":"2.0","id":"abc-456","result":{"reply":{"status":{"code":200,"detail":"OK"},"entries":[...],"cursor":"..."}}}
-```
-:::
 
 #### Error Responses {#http-error-responses}
 
-- If the `dwn-request` header is missing: HTTP `400` with a JSON-RPC error
-  response body (code `-50400`).
-- If the `dwn-request` header contains invalid JSON: HTTP `400` with a JSON-RPC
-  error response body (code `-32700`).
-- If the DWN message handler throws an unexpected error: HTTP `500` with the
-  JSON-RPC response containing the error.
-- All other DWN-level errors (401, 404, 409, etc.) are returned as successful HTTP
-  responses (HTTP `200`) with the DWN status code in the `reply.status.code` field
-  inside the JSON-RPC result. The HTTP status code reflects transport-level success;
-  the DWN status code reflects application-level outcome.
+- **Framing / `Content-Type` / UTF-8 / invalid JSON envelope errors**: HTTP `400` with a JSON-RPC error response carrying code **`-50400`** (`BadRequest`). (Note: in current `dwn-server`, a valid non-object JSON value such as `null` passes JSON parsing and fails during routing with plain-text HTTP `500`.)
+- **Per-IP rate limit exceeded**: HTTP `429 Too Many Requests` with `Retry-After` header and plain JSON body `{"error":"Rate limit exceeded"}`.
+- **Per-tenant rate limit exceeded**: HTTP `429 Too Many Requests` with `Retry-After` header and JSON-RPC error code **`-50429`** (`TooManyRequests`) and `data: { retryAfterSec }`.
+- **Local-node profile rejections**: Non-loopback `Host` header returns HTTP `403 Forbidden`; missing/invalid bearer token or mismatched `Origin` returns HTTP `401` with `{"error":"Unauthorized"}`.
+- **All other JSON-RPC errors** returned by the JSON-RPC router (`-32600`, `-32601`, `-32602`, `-32603`, `-50403`, quota errors, and WebSocket-only subscription control methods sent over HTTP which return `-32600`): HTTP **`500`** with the JSON-RPC error envelope in the body.
+- **DWN-level outcomes** (`200`, `202`, `204`, `400`, `401`, `404`, `409`, `410`, `500`, `501`): returned inside HTTP `200 OK` with the DWN status in `result.reply.status.code` (or `result.result` for `dwn.applyReplicatedMessage`).
 
-::: note
-This design means that an HTTP `200` does not necessarily indicate a successful DWN
-operation. Clients ****MUST**** inspect `result.reply.status.code` in the JSON-RPC
-response to determine the outcome. HTTP-level error codes (4xx, 5xx) indicate
-transport or envelope failures only.
-:::
+#### Client Retry and Timeout Behavior
+
+`HttpDwnRpcClient` applies default request timeouts of **30 seconds** (extended to **300 seconds** for `dwn.applyReplicatedMessage` whenever `message.descriptor.dataSize > 1_048_576`, including bodyless `ancestryOnly` writes) and retries transient network errors (`TypeError`) and HTTP `408`, `429`, `500`, `502`, `503`, `504` up to 3 times using jittered exponential backoff (`500ms` to `10s`, respecting `Retry-After` capped at `10s`), skipping retries on HTTP `500` responses containing a terminal JSON-RPC error and never retrying non-replayable `ReadableStream` bodies. `DwnServerInfoCacheMemory` caches `GET /info` responses for **15 minutes** by default.
 
 ### CORS {#cors}
 
-Servers ****MUST**** include the following CORS headers on every HTTP response:
+On public (non-local-node) deployments, servers return the following CORS
+headers on all routes except `/admin*` and `/metrics` (including DWN `/`, REST,
+`/info`, `/health`, `/registration*`, `/provider-auth/*`, `/local/*`, `404`
+responses, and `/connect/*` relay routes defined in the
+[Enbox Connect Protocol specification](https://github.com/enboxorg/web5-connect-spec)):
 
 | Header | Value |
 |---|---|
 | `Access-Control-Allow-Origin` | `*` |
 | `Access-Control-Allow-Methods` | `GET, POST, OPTIONS` |
 | `Access-Control-Allow-Headers` | `*` |
-| `Access-Control-Expose-Headers` | `dwn-response, dwn-payment` |
+| `Access-Control-Expose-Headers` | `dwn-response` |
+| `Access-Control-Max-Age` | `86400` |
 
-Servers ****MUST**** respond to `OPTIONS` preflight requests with HTTP `204 No Content`
-and the above headers.
+`OPTIONS` preflight requests return HTTP `204 No Content`.
 
-::: note
-The `dwn-response` and `dwn-payment` headers must be listed in
-`Access-Control-Expose-Headers` to ensure browser-based clients can read them.
-Without this, the headers are opaque to JavaScript running in a browser context.
-:::
+Under the **Local Node Profile**, wildcard `*` is **never** used:
+`Access-Control-Allow-Origin` reflects the request `Origin` with `Vary: Origin`
+only for `/info`, `/local/pair`, matching-origin `/local/pair/:requestId`, or
+already-paired origins, and `Access-Control-Allow-Headers` is narrowed to
+`authorization, content-type`.
 
 ### Method Restrictions {#http-method-restrictions}
 
-All DWN interface methods are supported over HTTP. The HTTP transport is the
-****only**** transport that supports `RecordsWrite` messages with data, because
-the binary data is carried in the HTTP request body.
+All non-subscribe DWN methods (`dwn.processMessage` and
+`dwn.applyReplicatedMessage`) are supported over HTTP. HTTP is required for
+streaming large `RecordsWrite` data, `RecordsRead`/`MessagesRead` data streams,
+and `dwn.applyReplicatedMessage` with `includeMaterializationConfirmation: true`.
+(Note: `rpc.subscribe.dwn.processMessage` with a `Subscribe` message, as well as
+`rpc.subscribe.close` and `rpc.ack`, return JSON-RPC `-32600` over HTTP; however,
+`rpc.subscribe.dwn.processMessage` with a non-subscribe message is executed by
+the router over HTTP.)
 
 ## WebSocket Transport {#websocket-transport}
 
-The WebSocket transport is used for real-time subscriptions and lightweight
-request-response messaging. It provides persistent, bidirectional communication
-between a [[ref:DWN Client]] and a [[ref:DWN Server]].
+The WebSocket transport provides real-time subscriptions (`RecordsSubscribe`,
+`MessagesSubscribe`), sliding-window backpressure, dual-layer liveness, and
+pooled low-latency routing for eligible control-plane and small/ancestry-only
+replicated-apply RPCs.
 
 ### Connection Establishment {#ws-connection}
 
-A client establishes a WebSocket connection by sending an HTTP `Upgrade` request
-to the same base [[ref:Service Endpoint]] URL used for HTTP:
+Clients upgrade at the base [[ref:Service Endpoint]] URL (`GET /` with
+`Upgrade: websocket`; note that `dwn-server` accepts WebSocket upgrades on any
+`GET` path and runs upgrade handling prior to per-IP HTTP rate limiting).
+Remote endpoints ****SHOULD**** use `wss://`; loopback local-node endpoints may
+use `ws://`. Clients should check `ServerInfo.webSocketSupport` before opening
+a WebSocket (`JsonRpcSocket` uses a default **3-second** `connectTimeout`; when
+`webSocketSupport === false`, `dwn-server` does not attach a `SocketConnection`
+to upgraded sockets).
 
-```
-GET wss://dwn.example.com/ HTTP/1.1
-Upgrade: websocket
-Connection: Upgrade
-```
+Under the **Local Node Profile**, WebSocket upgrades are never public and
+authenticate via `Authorization: Bearer <token>` OR query parameter
+`?localNodeToken=<token>` (alongside strict `Origin` binding). Clients redact
+query parameters and credentials from connection error messages.
 
-- The server ****MUST**** accept WebSocket upgrade requests at the root path.
-- The WebSocket connection ****MUST**** use TLS (`wss://`).
-- If the upgrade fails, the server ****MUST**** return HTTP `400`.
+### Message Framing and Payload Limits {#ws-framing}
 
-### Message Framing {#ws-framing}
+Each WebSocket message carries a single JSON-serialized `JsonRpcRequest`
+(client → server) or `JsonRpcResponse` (server → client). Batching is not
+supported.
 
-All WebSocket messages are JSON-encoded **text frames**. Binary frames are not used.
-
-- **Client → Server:** JSON-serialized `JsonRpcRequest` objects.
-- **Server → Client:** JSON-serialized `JsonRpcResponse` objects.
-
-Each text frame contains exactly one JSON-RPC message. Batching multiple messages
-in a single frame is not supported.
+- **Server maximum frame size**: `maxWsJsonRpcPayloadBytes(maxRecordDataSize) = Math.ceil(maxRecordDataSize / 3) * 4 + 65_536` (for the default `100 MiB` `maxRecordDataSize`, ~`133.4 MiB`, accommodating base64url `dwn.applyReplicatedMessage` payloads).
+- **Client pooled-socket opportunistic routing cap**: `WS_JSON_RPC_ENVELOPE_BYTES = 65_536` (**64 KiB total UTF-8 JSON-RPC frame**, including both envelope metadata and base64url-encoded `params.encodedData` — roughly 47–48 KiB of raw record bytes).
+- **Invalid JSON / empty frame**: Returns a JSON-RPC error with code **`-50400`** (`BadRequest`) and a server-generated UUID `id`.
 
 ### Request-Response Correlation {#ws-correlation}
 
-The `id` field in the JSON-RPC request and response ****MUST**** be used to correlate
-requests with responses. Since a WebSocket connection may carry multiple concurrent
-requests, clients ****MUST**** use unique `id` values per connection and match
-incoming responses by `id`.
-
-::: example WebSocket Request-Response
-```
-Client → {"jsonrpc":"2.0","id":"q1","method":"dwn.processMessage","params":{"target":"did:example:alice","message":{...}}}
-Server → {"jsonrpc":"2.0","id":"q1","result":{"reply":{"status":{"code":200},"entries":[...]}}}
-```
-:::
+Requests and responses are correlated by JSON-RPC `id`. Subscription pushes
+carry the client-assigned `subscription.id` as the JSON-RPC response `id`.
+(Implementation note: in current `dwn-server`, `enforceQuota` sets the error
+response `id` to `message.recordId ?? crypto.randomUUID()` rather than the
+incoming JSON-RPC `id`, so quota errors over WebSocket do not correlate with
+pending request IDs.)
 
 ### Subscriptions {#ws-subscriptions}
 
-WebSocket is the ****only**** transport that supports DWN subscriptions
-(`RecordsSubscribe` and `MessagesSubscribe`).
+WebSocket is the ****only**** transport supporting `RecordsSubscribe` and
+`MessagesSubscribe`.
 
 #### Opening a Subscription {#ws-open-subscription}
 
-To open a subscription, the client sends a `rpc.subscribe.dwn.processMessage`
-request with a `subscription` object containing a client-assigned `id`:
+The client sends `rpc.subscribe.dwn.processMessage` with `subscription: { id }`:
 
 ```json
 {
@@ -578,7 +602,8 @@ request with a `subscription` object containing a client-assigned `id`:
       "descriptor": {
         "interface": "Records",
         "method": "Subscribe",
-        "filter": { "protocol": "https://social.example/protocol" }
+        "messageTimestamp": "2026-06-01T00:00:00.000000Z",
+        "filter": { "module": "https://social.example/modules/feed" }
       },
       "authorization": { ... }
     }
@@ -587,50 +612,19 @@ request with a `subscription` object containing a client-assigned `id`:
 }
 ```
 
-The server processes the subscribe message on the DWN. If successful, the server
-returns a success response and begins pushing events for the subscription.
-
-To resume a subscription after a disconnect (cursor mode), the client includes a
-`cursor` field in the descriptor with a [[ref:Cursor]] value obtained from a prior
-subscription event:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "req-1",
-  "method": "rpc.subscribe.dwn.processMessage",
-  "params": {
-    "target": "did:example:alice",
-    "message": {
-      "descriptor": {
-        "interface": "Records",
-        "method": "Subscribe",
-        "filter": { "protocol": "https://social.example/protocol" },
-        "cursor": "<opaque-cursor-string>"
-      },
-      "authorization": { ... }
-    }
-  },
-  "subscription": { "id": "sub-2" }
-}
-```
-
-In cursor mode, the server replays stored events after the cursor, sends an
-[EOSE marker](#ws-eose), then continues with live events.
+- The server reserves `subscription.id` before async validation/replay (duplicate ID returns `-32602`).
+- In cursor mode, replay frames may arrive before the opening JSON-RPC response resolves; clients refresh their 30-second subscribe timeout as replay frames arrive.
+- **Snapshot & anchor replies**:
+  - `RecordsSubscribe` (no `cursor`): reply includes `entries` and optional pagination `cursor`; no EOSE is sent.
+  - `MessagesSubscribe` (owner/delegate): reply includes `head` (current log head, or empty-log anchor `{ streamId, epoch, position: "0" }` omitting `messageCid`) and optional canonical-scope `fingerprint`, captured after the live listener is registered. Role-authorized `MessagesSubscribe` replies omit `head`/`fingerprint` and include `roleRecordId`.
+- **`ProgressGap` (`410`)**: If `cursor` is no longer replayable, the DWN returns a JSON-RPC success response whose `result.reply` has `status: { code: 410, detail: "Progress token gap" }` and `error: { code: "ProgressGap", requested, oldestAvailable, latestAvailable, reason }` where `reason` is `"token_too_old" | "token_too_new" | "epoch_mismatch" | "stream_mismatch" | "message_mismatch"`.
 
 #### Subscription Events {#ws-subscription-events}
 
-After a successful subscribe response, the server pushes
-[[ref:SubscriptionMessage]] objects as JSON-RPC responses where:
+Pushed frames set `id` to `subscription.id` and `result.subscription` to a
+3-way [[ref:SubscriptionMessage]] union:
 
-- `id` is the **subscription** `id` (not the original request `id`).
-- `result.subscription` contains a [[ref:SubscriptionMessage]] — a discriminated
-  union with a `type` field of `"event"` or `"eose"`.
-
-##### Event Messages {#ws-event-messages}
-
-An event message carries the DWN event payload and an opaque [[ref:Cursor]]
-string identifying the event's position in the EventLog.
+##### Event Messages (`type: "event"`) {#ws-event-messages}
 
 ```json
 {
@@ -639,7 +633,17 @@ string identifying the event's position in the EventLog.
   "result": {
     "subscription": {
       "type": "event",
-      "cursor": "<opaque-cursor-string>",
+      "cursor": {
+        "streamId": "<stream-id>",
+        "epoch": "<stream-epoch>",
+        "position": "<monotonic-position>",
+        "messageCid": "<message-cid>"
+      },
+      "seq": "<monotonic-position>",
+      "messageCid": "<message-cid>",
+      "isLatestBaseState": true,
+      "module": "https://social.example/modules/feed",
+      "encodedData": "<optional-base64url>",
       "event": {
         "message": { ... },
         "initialWrite": { ... }
@@ -651,17 +655,19 @@ string identifying the event's position in the EventLog.
 
 | Field | Type | Description |
 |---|---|---|
-| `type` | `"event"` | Discriminator for an event message |
-| `cursor` | `string` | Opaque EventLog cursor. Used for [flow control](#ws-flow-control) acknowledgment and for reconnection. Clients ****SHOULD**** persist this value. |
-| `event` | `object` | The event payload containing `message` (the DWN message) and optionally `initialWrite` (the initial `RecordsWrite` for update/delete events). |
+| `type` | `"event"` | Event discriminator |
+| `cursor` | `ProgressToken` | Replay token used for `rpc.ack` flow control and reconnection |
+| `seq` | `string` (optional) | Source feed decimal sequence position |
+| `messageCid` | `string` (optional) | Stored message CID |
+| `isLatestBaseState` | `boolean` (optional) | Whether the message was indexed as latest base state |
+| `module` | `string` (optional) | Indexed module URI |
+| `encodedData` | `string` (optional) | Inline base64url data (`<= 30,000` bytes; detached from `event.message` and `event.initialWrite`, omitted in `metadataOnly` mode) |
+| `event` | `object` | `{ message, initialWrite? }` |
 
-##### EOSE (End-of-Stored-Events) {#ws-eose}
+##### EOSE (`type: "eose"`) {#ws-eose}
 
-When a subscription is created with a `cursor` (cursor mode), the server replays
-all stored events after that cursor position. After replay is complete, the server
-sends an EOSE marker to signal that all subsequent messages are live events.
-
-Subscriptions created without a cursor (snapshot mode) never receive EOSE.
+Delivered in cursor mode after stored replay reaches the frozen catch-up
+high-water token (`bounds.latest`, or input `cursor` if the log is empty):
 
 ```json
 {
@@ -670,43 +676,48 @@ Subscriptions created without a cursor (snapshot mode) never receive EOSE.
   "result": {
     "subscription": {
       "type": "eose",
-      "cursor": "<opaque-cursor-string>"
+      "cursor": {
+        "streamId": "<stream-id>",
+        "epoch": "<stream-epoch>",
+        "position": "<monotonic-position>",
+        "messageCid": "<optional-message-cid>"
+      }
     }
   }
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `type` | `"eose"` | Discriminator for the End-of-Stored-Events marker |
-| `cursor` | `string` | Opaque cursor of the last replayed stored event. If no stored events matched (i.e. the subscriber was already caught up), this echoes the input cursor. |
+##### Terminal Error Messages (`type: "error"`) {#ws-error-messages}
 
-##### Subscription Modes {#ws-subscription-modes}
+Sent when the server terminates a subscription mid-stream (e.g., delivery-time
+grant/role revocation, mid-stream `ProgressGap`, `SubscriptionBufferOverflow`,
+or `SubscriptionBufferTimeout`):
 
-Subscriptions operate in one of two modes depending on the DWN subscribe message:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "sub-1",
+  "result": {
+    "subscription": {
+      "type": "error",
+      "cursor": {
+        "streamId": "<stream-id>",
+        "epoch": "<stream-epoch>",
+        "position": "<monotonic-position>",
+        "messageCid": "<optional-message-cid>"
+      },
+      "error": {
+        "code": "SubscriptionBufferTimeout",
+        "detail": "subscription ACKs did not free buffer capacity before the deadline"
+      }
+    }
+  }
+}
+```
 
-- **Snapshot mode** (no `cursor` in the subscribe descriptor): The DWN returns an
-  initial set of matching records in the subscribe reply's `entries` field, then
-  delivers only live events through the subscription. No EOSE is sent.
-
-- **Cursor mode** (`cursor` present in the subscribe descriptor): The DWN replays
-  stored events from the EventLog starting after the cursor, sends an EOSE marker,
-  then continues with live events. No `entries` are returned in the subscribe reply.
-
-Cursor mode enables clients to reconnect after a disconnect without missing events.
-See the [DWN specification](https://github.com/enboxorg/dwn-spec) for full details
-on subscription modes and EventLog semantics.
-
-##### Deduplication {#ws-deduplication}
-
-Clients ****SHOULD**** deduplicate events by `messageCid`, as the DWN specification
-notes that duplicate events may be received. This is especially relevant during the
-catch-up → live transition in cursor mode, where the EventLog implementation buffers
-live events during replay.
+Clients ****MUST NOT**** treat `cursor` on an error message as an applied checkpoint.
 
 #### Closing a Subscription {#ws-close-subscription}
-
-To close a subscription, the client sends a `rpc.subscribe.close` request:
 
 ```json
 {
@@ -717,214 +728,140 @@ To close a subscription, the client sends a `rpc.subscribe.close` request:
 }
 ```
 
-The server ****MUST**** stop sending events for the closed subscription and release
-associated resources. All active subscriptions ****MUST**** be automatically closed
-when the WebSocket connection is closed.
+Server stops delivery, cleans up resources, and replies
+`{ "reply": { "status": 200, "detail": "Accepted" } }`. Closing the WebSocket
+automatically closes all active subscriptions on that connection.
 
 #### Flow Control (Backpressure) {#ws-flow-control}
 
-To prevent a fast-producing server from overwhelming a slow-consuming client,
-the WebSocket transport implements a **sliding window** flow control mechanism
-using the `rpc.ack` method.
+The server maintains a per-subscription sliding window (`FlowController`) with:
+- **`maxInFlight`**: default `32` (advertised in `/info`).
+- **`MAX_BUFFER_SIZE`**: `1000` buffered messages beyond `maxInFlight`.
+- **`MAX_BUFFER_WAIT_MS`**: `30_000` ms (30 seconds). When the buffer is full,
+  the producer awaits capacity for up to 30 seconds; on timeout the server emits
+  terminal `{ type: "error", cursor, error: { code: "SubscriptionBufferTimeout", detail } }`
+  and closes the subscription. Pushing past `1000` without awaiting emits
+  `SubscriptionBufferOverflow` and closes the subscription.
 
-##### Server Behavior
-
-The server maintains a per-subscription window of **unacknowledged events**. The
-maximum window size is configured by the server and advertised as `maxInFlight`
-in the [ServerInfo](#server-info-object) response.
-
-- When the server has an event to deliver, it checks the window:
-  - If the number of unacknowledged events is **less than** `maxInFlight`, the
-    event is sent immediately.
-  - If the window is **full**, the event is buffered.
-- When the server receives an `rpc.ack` for a subscription, it acknowledges all
-  events up to and including the specified cursor (cumulative acknowledgment) and
-  flushes buffered events into the freed window slots.
-- If the buffer exceeds a server-defined maximum (****RECOMMENDED**** 1000), the
-  server ****MUST**** close the subscription to prevent unbounded memory growth.
-
-::: note
-Both `"event"` and `"eose"` messages count toward the `maxInFlight` window.
-Clients ****MUST**** acknowledge EOSE messages the same way as event messages.
-:::
-
-##### `rpc.ack` Method {#method-rpc-ack}
-
-The client sends `rpc.ack` to acknowledge receipt and processing of subscription
-events. This is a JSON-RPC **notification** (no `id` field is required, and no
-response is expected on success).
+Both `"event"` and `"eose"` messages consume window slots and ****MUST**** be
+acknowledged via `rpc.ack`:
 
 ```json
 {
   "jsonrpc": "2.0",
   "method": "rpc.ack",
-  "params": { "cursor": "abc123" },
+  "params": {
+    "cursor": {
+      "streamId": "<stream-id>",
+      "epoch": "<stream-epoch>",
+      "position": "<monotonic-position>",
+      "messageCid": "<optional-message-cid>"
+    }
+  },
   "subscription": { "id": "sub-1" }
 }
 ```
 
-**Parameters:**
+- `ack(cursor)` verifies `streamId` and `epoch` against the oldest unacked entry
+  and cumulatively acknowledges all unacked entries up to `cursor.position`
+  (matching `messageCid` when present). Unknown/stale tokens are ignored.
+- Clients chain `rpc.ack` strictly in arrival order, gating both `lastCursor`
+  advancement and `rpc.ack` emission on the consumer handler promise completing
+  (halting on `SubscriptionHandlerTerminalError`).
+- `rpc.ack` is transport-layer flow control only; durable sync checkpoints are
+  persisted separately by clients/agents after local admission.
 
-- `cursor` — The cursor from the most recently processed [[ref:SubscriptionMessage]].
-  ****MUST**** be a non-empty string.
+### Heartbeat and Wake Liveness {#ws-heartbeat}
 
-**Subscription:**
+Connections use **dual-layer liveness**:
 
-- `id` — The identifier of the subscription being acknowledged.
+1. **Server RFC 6455 `ping` / `pong`**: The server sends WebSocket `ping` frames
+   every **30 seconds** and terminates connections that fail to respond with
+   `pong` before the next interval.
+2. **Client `rpc.ping` heartbeat**: Clients send application-level `rpc.ping`
+   every **30 seconds** with a **10-second** response timeout.
+3. **Wake-triggered on-demand probe (`checkHealth`)**: On browser `online` and
+   `visibilitychange` (`visible`) events, `WebSocketDwnRpcClient` sends an
+   out-of-band `rpc.ping` with a **5-second** timeout to immediately detect
+   silently dead connections after sleep/backgrounding and fast-forward
+   reconnection.
+4. **Reconnection and resubscription**: Clients reconnect with jittered
+   exponential backoff (`1s` to `30s`), pause reconnect attempts while offline,
+   emit local transport lifecycle notifications (`disconnected`, `reconnecting`,
+   `reconnected`), and re-open generic subscriptions via
+   `resubscribeFactory(lastCursor)` (emitting a client-synthesized terminal
+   `SubscriptionError` with `code: "SubscriptionRecoveryFailed"` if automatic
+   resubscription fails).
 
-**Behavior:**
+### Method Restrictions and Pooled WebSocket Routing {#ws-method-restrictions}
 
-- The acknowledgment is **cumulative**: acking cursor X acknowledges all events
-  with cursors up to and including X.
-- Clients ****SHOULD**** send `rpc.ack` after processing each event or batch of events.
-- If the cursor is unknown (e.g., stale or duplicate), the server ****SHOULD****
-  ignore the acknowledgment silently.
-
-##### Client Implementation
-
-Clients ****MUST**** send `rpc.ack` after processing each subscription message to
-advance the server's flow-control window. A client that does not send acknowledgments
-will stop receiving events once the server's window fills up, and will eventually
-have its subscription closed if the buffer overflows.
-
-A ****RECOMMENDED**** client implementation sends `rpc.ack` immediately after the
-subscription message handler returns:
-
-```
-receive SubscriptionMessage → invoke handler → send rpc.ack(cursor)
-```
-
-### Heartbeat {#ws-heartbeat}
-
-The server ****MUST**** send WebSocket `ping` frames at a regular interval
-(****RECOMMENDED**** every 30 seconds) to detect stale connections.
-
-If a client does not respond with a `pong` frame before the next ping interval,
-the server ****SHOULD**** close the connection.
-
-Clients ****MUST**** respond to `ping` frames with `pong` frames as defined by
-the [WebSocket protocol (RFC 6455)](https://datatracker.ietf.org/doc/html/rfc6455).
-
-### Method Restrictions {#ws-method-restrictions}
-
-- `RecordsWrite` messages with data ****MUST NOT**** be sent over WebSocket.
-  Clients ****MUST**** use the [HTTP transport](#http-transport) for `RecordsWrite`
-  operations that include record data.
-- Subscribe methods (`rpc.subscribe.dwn.processMessage`) are ****only**** supported
-  over WebSocket. Clients ****MUST NOT**** send subscribe requests over HTTP.
-- All other `dwn.processMessage` requests (queries, reads without data, deletes,
-  protocol operations, sync) ****MAY**** be sent over either HTTP or WebSocket.
-
-| DWN Method | HTTP | WebSocket |
-|---|---|---|
-| `RecordsWrite` (with data) | Yes | No |
-| `RecordsRead` (response has data) | Yes | No |
-| `RecordsQuery` | Yes | Yes |
-| `RecordsSubscribe` | No | Yes |
-| `RecordsDelete` | Yes | Yes |
-| `RecordsCount` | Yes | Yes |
-| `ProtocolsConfigure` | Yes | Yes |
-| `ProtocolsQuery` | Yes | Yes |
-| `MessagesRead` | Yes | No |
-| `MessagesSubscribe` | No | Yes |
-| `MessagesSync` | Yes | Yes |
-
+| Operation | HTTP | WebSocket | Notes |
+|---|---|---|---|
+| `dwn.processMessage` — `RecordsWrite` | Yes | **No** | Server rejects ALL `RecordsWrite` via `dwn.processMessage` over WS with `-32602` (even `dataSize === 0`). |
+| `dwn.processMessage` — `RecordsRead` / `MessagesRead` | Yes | Avoid | Server does not stream binary data over WS (cancels stream and omits data); clients route Reads over HTTP. |
+| `dwn.processMessage` — `RecordsQuery`, `RecordsCount`, `RecordsDelete`, `ModulesConfigure`, `ModulesQuery`, `MessagesQuery` | Yes | Yes | Pooled WS client opportunistically routes requests whose total UTF-8 JSON-RPC frame is `<= 64 KiB` without `signal`/`timeoutMs` over an already-connected socket. |
+| `dwn.applyReplicatedMessage` (with streaming data) | Yes | Conditional | Over WS, supported for `dataSize === 0`, `ancestryOnly: true`, or inline `params.encodedData` within frame limits. Opportunistic pooled WS routing accepts only `undefined`, `Blob`, `ArrayBuffer`, or `ArrayBufferView` payloads whose full UTF-8 JSON-RPC frame (envelope + base64url data) is `<= 64 KiB` (`ReadableStream` and `string` fall back to HTTP). |
+| `dwn.applyReplicatedMessage` (`includeMaterializationConfirmation: true`) | Yes (local-node auth only) | **No** | Rejected over WS with `-32602`; requires local-node auth over HTTP (`-50403` otherwise). (`false` is accepted on either transport.) |
+| `rpc.subscribe.dwn.processMessage` (`RecordsSubscribe`, `MessagesSubscribe`) | **No** | Yes | WebSocket only (returns `-32600` for Subscribe messages over HTTP). |
+| `rpc.subscribe.close`, `rpc.ack`, `rpc.ping` | No (`rpc.ping` accepted by router) | Yes | WebSocket control methods (`close` and `ack` return `-32600` over HTTP). |
 
 ## REST Convenience API {#rest-api}
 
-In addition to the JSON-RPC endpoint, [[ref:DWN Servers]] ****MUST**** expose a set
-of read-only REST endpoints for simple, unauthenticated resource access. These
-endpoints enable web browsers, `<img>` tags, `<video>` tags, curl, and other HTTP
-clients to access published DWN data without constructing DWN messages.
-
-All REST convenience routes create anonymous (unsigned) DWN messages internally.
-They can only access data that is publicly readable (i.e., the protocol's `$actions`
-grants `read` to `anyone`, or the record is published).
+[[ref:DWN Servers]] expose read-only REST endpoints that internally construct
+anonymous (unsigned) DWN messages for publicly readable records and published
+modules. Read and module-query endpoints map `401` responses to empty HTTP `404`
+to avoid existence oracles (whereas `GET /:did/query` unconditionally returns
+HTTP `200` with the JSON `RecordsQueryReply`). Prototype-pollution query keys
+(`__proto__`, `constructor`, and `prototype`) are silently ignored (stripped)
+by REST query parsers. `dwn-server` does not emit `Cache-Control` or `ETag`
+headers on REST responses.
 
 ### Record Read {#rest-record-read}
 
 ```
-GET /:did/read/records/:recordId
-GET /:did/records/:recordId
+GET /:did/read/records/:id
+GET /:did/records/:id
 ```
 
-Reads a single record by its Record ID.
+- **200 with data**: Body is the raw record bytes; `Content-Type` is
+  `descriptor.dataFormat`; `dwn-response` header contains `JSON.stringify(reply)`
+  (a raw `RecordsReadReply`, not a JSON-RPC envelope; in current `dwn-server`,
+  `entry.data` is not deleted prior to serialization and appears as `"data":{}`).
+- **200 without data**: Returns HTTP `400`.
+- **401**: Returns empty HTTP `404`.
+- **404**: Returns HTTP `404` with the JSON `RecordsReadReply` body.
+- **Other status codes** (e.g., `410`): Returns that HTTP status with JSON reply.
 
-**Path Parameters:**
-- `:did` — The DID of the [[ref:Tenant]].
-- `:recordId` — The Record ID of the record to read.
-
-**Response:**
-- **200 with data:** The response body is the raw record data. The `Content-Type`
-  header ****MUST**** be set to the record's `dataFormat` value (e.g., `image/png`,
-  `application/json`). The `dwn-response` header contains the full DWN `RecordsRead`
-  reply as JSON.
-- **404:** The record does not exist or is not publicly readable. Servers ****MUST****
-  return `404` (not `401`) for unauthorized reads to prevent information disclosure
-  about record existence.
-
-### Protocol Record Read {#rest-protocol-record-read}
+### Module Record Read {#rest-module-record-read}
 
 ```
-GET /:did/read/protocols/:protocol/*protocolPath
+GET /:did/read/modules/:module/*
 ```
 
-Reads the most recently published record at a given protocol path.
+- `:module` — base64url-encoded module URI.
+- `*` — non-empty `modulePath` (empty path returns HTTP `400`).
+- Optional dot-notation query parameters (e.g., `filter.schema`, `filter.dataFormat`, `filter.tags.*`).
+- Queries matching records with `pagination.limit = 1` and `dateSort = publishedDescending`, then returns the `RecordsRead` response (same response format as [Record Read](#rest-record-read)).
 
-**Path Parameters:**
-- `:did` — The DID of the [[ref:Tenant]].
-- `:protocol` — The protocol URI, encoded as base64url.
-- `*protocolPath` — The protocol path (e.g., `post/comment`).
-
-**Query Parameters:**
-
-Additional filter properties ****MAY**** be passed as dot-notation query parameters.
-For example:
+### Module Definition Read {#rest-module-definition-read}
 
 ```
-GET /did:example:alice/read/protocols/aHR0cHM6Ly9leGFtcGxl/post?filter.schema=https://example.com/post&filter.dataFormat=application/json
+GET /:did/read/modules/:module
 ```
 
-**Behavior:**
+- `:module` — base64url-encoded module URI.
+- Issues anonymous `ModulesQuery` with `filter: { module }`.
+- **200**: Body is `entries[0]` (the full `ModulesConfigure` message JSON).
+- **404**: Module not installed or not published (`401` mapped to empty `404`).
 
-The server queries for records matching the protocol and protocol path with
-`pagination.limit` of `1` and `dateSort` of `publishedDescending` (most recent
-first). If a matching record is found, the server performs a `RecordsRead` and
-returns the result.
-
-**Response:** Same as [Record Read](#rest-record-read).
-
-### Protocol Definition Read {#rest-protocol-definition-read}
+### Module Query {#rest-module-query}
 
 ```
-GET /:did/read/protocols/:protocol
+GET /:did/query/modules
 ```
 
-Reads the protocol definition for a given protocol URI.
-
-**Path Parameters:**
-- `:did` — The DID of the [[ref:Tenant]].
-- `:protocol` — The protocol URI, encoded as base64url.
-
-**Response:**
-- **200:** The response body is the JSON-serialized protocol definition object.
-  `Content-Type` is `application/json`.
-- **404:** The protocol is not installed or not publicly visible.
-
-### Protocol Query {#rest-protocol-query}
-
-```
-GET /:did/query/protocols
-```
-
-Lists all protocols installed on the tenant's DWN.
-
-**Path Parameters:**
-- `:did` — The DID of the [[ref:Tenant]].
-
-**Response:**
-- **200:** The response body is a JSON array of protocol definition entries.
-  `Content-Type` is `application/json`.
+- Issues anonymous `ModulesQuery` with no filter.
+- **200**: Body is JSON array `entries` of all published `ModulesConfigure` messages (`401` mapped to empty `404`).
 
 ### Record Query {#rest-record-query}
 
@@ -932,153 +869,124 @@ Lists all protocols installed on the tenant's DWN.
 GET /:did/query
 ```
 
-Queries records with optional filters, pagination, and sorting.
-
-**Path Parameters:**
-- `:did` — The DID of the [[ref:Tenant]].
-
-**Query Parameters:**
-
-Filter and pagination options are passed as dot-notation query parameters:
+Queries publicly readable records using dot-notation query parameters mapped
+directly as string leaf values into `RecordsQuery` options:
 
 | Parameter | Description |
 |---|---|
-| `filter.protocol` | Protocol URI to filter by |
-| `filter.protocolPath` | Protocol path to filter by |
-| `filter.schema` | Schema URI to filter by |
-| `filter.dataFormat` | MIME type to filter by |
+| `filter.module` | Normalized module URI |
+| `filter.modulePath` | Module path |
+| `filter.schema` | Schema URI |
+| `filter.dataFormat` | Media type |
 | `filter.recordId` | Specific record ID |
-| `pagination.limit` | Maximum number of results |
-| `pagination.cursor` | Pagination cursor from a previous response |
-| `dateSort` | Sort order (`createdAscending`, `createdDescending`, `publishedAscending`, `publishedDescending`) |
+| `filter.contextId` | Context ID subtree |
+| `filter.tags.<key>` | String tag filter value |
+| `dateSort` | `createdAscending`, `createdDescending`, `publishedAscending`, `publishedDescending`, `updatedAscending`, `updatedDescending` |
+
+::: note
+Because `dwn-server`'s REST query parser assigns query parameter values as raw
+strings without numeric type coercion (and DWN JSON Schema validation does not
+coerce types), passing `pagination.limit=<n>` fails schema validation (`type: "number"`)
+and returns HTTP `400`. Similarly, `pagination.cursor` is a structured
+`{ messageCid, value }` object rather than a scalar string.
+:::
 
 ::: example Record Query
 ```
-GET /did:example:alice/query?filter.protocol=https://social.example&filter.protocolPath=post&pagination.limit=10&dateSort=publishedDescending
+GET /did:example:alice/query?filter.module=https://social.example/modules/feed&filter.modulePath=post&dateSort=publishedDescending
 ```
 :::
 
-**Response:**
-- **200:** The response body is a JSON-serialized DWN `RecordsQueryReply` object
-  containing `status`, `entries`, and optionally `cursor` for pagination.
-  `Content-Type` is `application/json`.
-
+- **200**: JSON-serialized `RecordsQueryReply` (returned with HTTP `200 OK`
+  regardless of the inner `reply.status.code`, including `401`).
+- **400**: `{ "error": "Bad Request" }` on malformed parameters that fail
+  `RecordsQuery.create` schema validation.
 
 ## Server Information {#server-information}
 
 ### Info Endpoint {#info-endpoint}
 
-A [[ref:DWN Server]] ****MUST**** expose an information endpoint that describes the
-server's capabilities and requirements:
-
 ```
 GET /info
 ```
 
-**Response:**
+**Response (`200 OK`, `application/json` — multi-tenant remote server example):**
 
 ```json
 {
-  "server": "@enbox/dwn-server",
-  "version": "1.0.0",
-  "sdkVersion": "0.0.7",
-  "url": "https://dwn.example.com",
-  "webSocketSupport": true,
-  "maxFileSize": 1073741824,
+  "maxFileSize": 104857600,
   "maxInFlight": 32,
-  "registrationRequirements": ["proof-of-work-sha256-v0", "terms-of-service"],
+  "registrationRequirements": [
+    "proof-of-work-sha256-v0",
+    "terms-of-service",
+    "provider-auth-v0"
+  ],
+  "server": "@enbox/dwn-server",
+  "sdkVersion": "0.4.32",
+  "url": "https://dwn.example.com",
+  "version": "0.1.48",
+  "webSocketSupport": true,
   "providerAuth": {
     "authorizeUrl": "https://provider.example.com/authorize",
     "tokenUrl": "https://provider.example.com/token",
     "refreshUrl": "https://provider.example.com/refresh",
     "managementUrl": "https://provider.example.com/account"
-  },
-  "payment": {
-    "methods": ["per-message-payment-v0"],
-    "schemes": [
-      "urn:enbox:payment:l402:v0",
-      "urn:enbox:payment:cashu:v0"
-    ],
-    "currency": "sat",
-    "infoUrl": "https://provider.example.com/pricing"
   }
 }
 ```
 
-::: note
-The `providerAuth` object is only present when `provider-auth-v0` is included in
-`registrationRequirements`. Clients ****MUST NOT**** assume its presence unless the
-registration requirement is advertised.
-:::
+**Response (`200 OK`, `application/json` — Local Node Profile example):**
 
-::: note
-The `payment` object is only present when the server supports per-message payment.
-Clients ****MUST NOT**** assume its presence. Payment is orthogonal to registration —
-a server ****MAY**** require registration AND support per-message payment, or support
-payment without registration, or neither.
-:::
+```json
+{
+  "maxFileSize": 1073741824,
+  "maxInFlight": 32,
+  "registrationRequirements": [],
+  "server": "@enbox/dwn-server",
+  "sdkVersion": "0.4.32",
+  "url": "http://127.0.0.1:55500",
+  "version": "0.1.48",
+  "webSocketSupport": true,
+  "localNode": true,
+  "localPairing": {
+    "pairUrl": "http://127.0.0.1:55500/local/pair",
+    "pollUrlTemplate": "http://127.0.0.1:55500/local/pair/{requestId}"
+  }
+}
+```
 
 #### ServerInfo Object {#server-info-object}
 
 | Property | Type | Required | Description |
 |---|---|---|---|
-| `server` | `string` | Yes | Server implementation identifier |
-| `version` | `string` | Yes | Server version (semver) |
-| `sdkVersion` | `string` | Yes | DWN SDK version supported |
-| `url` | `string` | Yes | The canonical base URL of the server |
-| `webSocketSupport` | `boolean` | Yes | Whether the server supports WebSocket connections |
-| `maxFileSize` | `number` | Yes | Maximum data size in bytes for a single `RecordsWrite` |
-| `maxInFlight` | `number` | No | Maximum number of unacknowledged subscription events per subscription before the server pauses delivery. Defaults to `32` if not present. See [Flow Control](#ws-flow-control). |
-| `registrationRequirements` | `string[]` | Yes | List of registration requirements (empty array if open) |
-| `providerAuth` | `object` | Conditional | Provider auth configuration. ****MUST**** be present when `provider-auth-v0` is listed in `registrationRequirements`. |
-| `providerAuth.authorizeUrl` | `string` | Yes | URL to redirect the user for authentication, signup, or payment. ****MAY**** be on the DWN server domain or an external domain. |
-| `providerAuth.tokenUrl` | `string` | Yes | URL where the client exchanges an authorization code for a registration token. |
-| `providerAuth.refreshUrl` | `string` | No | URL to refresh an expired registration token. If absent, tokens do not support refresh. |
-| `providerAuth.managementUrl` | `string` | No | URL for user-facing account management. If absent, no management UI is available. |
-| `payment` | `object` | No | Payment capabilities. ****MUST**** be present when the server supports [Per-Message Payment](#per-message-payment). |
-| `payment.methods` | `string[]` | Yes | Payment flow methods supported. See [Payment Methods](#payment-methods). |
-| `payment.schemes` | `string[]` | Yes | [[ref:Payment Scheme]] URN identifiers supported. See [Payment Scheme Registry](#payment-scheme-registry). |
-| `payment.currency` | `string` | Yes | Base currency unit for pricing (e.g., `"sat"`, `"usd-cents"`). |
-| `payment.infoUrl` | `string` | No | URL to a human-readable pricing page. |
-
-#### Registration Requirement Values {#registration-requirement-values}
-
-| Value | Description |
-|---|---|
-| `proof-of-work-sha256-v0` | Client must complete a SHA-256 proof-of-work challenge |
-| `terms-of-service` | Client must accept the server's terms of service |
-| `provider-auth-v0` | The server requires authentication with the DWN provider's auth service. When present, the `providerAuth` object ****MUST**** be included in the Server Information response. |
+| `server` | `string` | Yes | Server implementation identifier (e.g., `"@enbox/dwn-server"`) |
+| `version` | `string` | Optional | Server package version (semver, omitted if unavailable) |
+| `sdkVersion` | `string` | Optional | DWN SDK version (semver, omitted if unavailable) |
+| `url` | `string` | Yes | Canonical base URL of the server |
+| `webSocketSupport` | `boolean` | Yes | Whether WebSocket connections are enabled |
+| `maxFileSize` | `number` | Yes | Advertised maximum record data size in bytes (default `104857600` = 100 MiB on `dwn-server`; `1073741824` = 1 GiB on `local-node`) |
+| `maxInFlight` | `number` | Optional | Maximum unacknowledged events per subscription (default `32`; when absent, server does not advertise backpressure) |
+| `registrationRequirements` | `string[]` | Yes | Active requirements (`"proof-of-work-sha256-v0"`, `"terms-of-service"`, `"provider-auth-v0"`; empty if open) |
+| `localNode` | `boolean` | Optional | `true` when running under the opt-in Local Node Profile |
+| `localPairing` | `object` | Optional | Present when `localNode === true`: `{ pairUrl, pollUrlTemplate }` derived from `url` |
+| `providerAuth` | `object` | Conditional | Present whenever `"provider-auth-v0"` is in `registrationRequirements`: `{ authorizeUrl, tokenUrl, refreshUrl?, managementUrl? }` |
 
 ### Health Endpoint {#health-endpoint}
-
-Servers ****SHOULD**** expose a health check endpoint:
 
 ```
 GET /health
 ```
 
-**Response:** `200 OK` with body `{"ok": true}` and `Content-Type: application/json`.
+Returns `200 OK`, `application/json`, `{"ok": true}`. (Protected by bearer auth when `localNodeProfileEnabled === true`.)
 
 ## Tenant Registration {#tenant-registration}
 
-Multi-tenant [[ref:DWN Servers]] ****MAY**** require tenant registration before accepting
-DWN messages for a given DID. Registration prevents abuse by requiring proof of
-computational work, acceptance of terms of service, and/or authentication with the
-DWN provider's auth service.
-
-A server that requires registration ****MUST**** advertise its requirements in the
-[ServerInfo](#server-info-object) `registrationRequirements` array. A server with
-an empty `registrationRequirements` array is open and does not require registration.
-
-### Registration Flow {#registration-flow}
-
-1. The client fetches the [ServerInfo](#info-endpoint) to discover registration requirements.
-2. If `proof-of-work-sha256-v0` is required, the client fetches a proof-of-work challenge.
-3. If `terms-of-service` is required, the client fetches the terms of service text.
-4. If `provider-auth-v0` is required, the client initiates the
-   [Provider Authentication](#provider-auth-registration) flow.
-5. The client computes the proof-of-work response and/or terms-of-service hash.
-6. The client submits the registration request.
+Multi-tenant [[ref:DWN Servers]] ****MAY**** require tenant registration before
+accepting DWN messages for a DID, advertising active requirements in
+`ServerInfo.registrationRequirements`. Disabled registration routes (e.g.,
+`/registration/proof-of-work` when PoW is disabled, `/registration/terms-of-service`
+when ToS is unset, or `/registration` when no registration store is configured)
+return HTTP `404 Not Found`.
 
 ### Proof-of-Work Challenge {#pow-challenge}
 
@@ -1086,51 +994,37 @@ an empty `registrationRequirements` array is open and does not require registrat
 GET /registration/proof-of-work
 ```
 
-**Response:** A JSON object describing the challenge:
+**Response (`200 OK`, `application/json`):**
 
 ```json
 {
-  "challengeNonce": "a1b2c3d4e5f6...",
+  "challengeNonce": "A1B2C3D4E5F6...64_HEX_CHARS...",
   "maximumAllowedHashValue": "000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
 }
 ```
 
 | Property | Type | Description |
 |---|---|---|
-| `challengeNonce` | `string` | A server-generated random nonce. |
-| `maximumAllowedHashValue` | `string` | A 256-bit value expressed as a 64-character uppercase hexadecimal string. The SHA-256 hash computed by the client ****MUST**** be numerically less than or equal to this value. A smaller value means higher difficulty. |
-
-The server ****MAY**** adjust `maximumAllowedHashValue` dynamically based on
-observed solve rates (e.g., decreasing the value when too many registrations
-arrive per minute and increasing it when activity subsides). Servers that
-adjust difficulty ****SHOULD**** do so gradually to avoid creating unsolvable
-challenges for clients that fetched a challenge just before a difficulty spike.
+| `challengeNonce` | `string` | 64-character hex server challenge nonce rotating every 10 minutes. Accepts previous & current nonces (uppercase random hex); when `challengeSeed` (`DWN_REGISTRATION_PROOF_OF_WORK_SEED`) is configured, nonces are deterministic lowercase SHA-256 hex and a `nextChallengeNonce` window is also accepted. |
+| `maximumAllowedHashValue` | `string` | 64-character hex upper bound adjusted adaptively (target 10 solves/minute, reevaluated every 10 seconds) |
 
 #### Solving the Challenge {#solving-challenge}
 
-The client ****MUST**** find a `responseNonce` such that:
+The client ****MUST**** find a **64-character hex** `responseNonce` (32 random
+bytes; non-reusable while present in the last-minute set, pruned on the 10-second
+difficulty timer for an effective 60–70s replay window) bound to the exact
+serialized `registrationData` such that:
 
 ```
-SHA-256(challengeNonce + responseNonce + requestData)
+BigInt("0x" + SHA-256_hex(challengeNonce + responseNonce + JSON.stringify(registrationData)))
+  <= BigInt("0x" + maximumAllowedHashValue)
 ```
 
-produces a hash whose numeric value is less than or equal to `maximumAllowedHashValue`.
-
-- `challengeNonce` — the nonce from the server's challenge response.
-- `responseNonce` — a 256-bit random value generated by the client, expressed as a
-  64-character uppercase hexadecimal string. The client iterates with fresh random
-  values until the hash satisfies the threshold.
-- `requestData` — the JSON-serialized `registrationData` object that will be
-  submitted in the [Registration Submission](#registration-submission) (i.e.,
-  `JSON.stringify(registrationData)`). Including `requestData` in the hash binds the
-  proof-of-work to the specific registration request, preventing an attacker from
-  solving once and replaying the solution for a different DID or terms-of-service
-  hash.
-
-To evaluate the result, the client converts the hex-encoded SHA-256 digest to a
-big integer and compares it to `maximumAllowedHashValue` (also interpreted as a
-big integer). If the digest is numerically less than or equal to the threshold,
-the `responseNonce` is a valid solution.
+Binding `JSON.stringify(registrationData)` prevents an attacker from pre-mining
+solutions independent of the target DID and terms-of-service hash. Because
+standard `JSON.stringify` (without JCS canonicalization) is used on both client
+and server, non-JavaScript clients ****MUST**** preserve the key order parsed
+from the submitted JSON (`did`, then `termsOfServiceHash`, with no whitespace).
 
 ### Terms of Service {#terms-of-service}
 
@@ -1138,143 +1032,45 @@ the `responseNonce` is a valid solution.
 GET /registration/terms-of-service
 ```
 
-**Response:** The terms of service as plain text (`Content-Type: text/plain`).
+Returns the terms of service as `text/plain`. The client computes the lowercase
+hex SHA-256 hash of the text and passes it in `registrationData.termsOfServiceHash`.
 
-The client computes a SHA-256 hash of the terms text (hex-encoded) to include in
-the registration request, indicating acceptance.
+### Provider Authentication Registration (`provider-auth-v0`) {#provider-auth-registration}
 
-### Provider Authentication Registration {#provider-auth-registration}
+When `provider-auth-v0` is advertised along with `ServerInfo.providerAuth`:
 
-When `provider-auth-v0` is listed in `registrationRequirements`, the server supports
-an OAuth2-inspired authentication flow where the DWN provider authenticates and
-authorizes the user through its own auth service. This enables paid DWN service
-providers to onboard tenants via login, payment, or plan selection flows.
-
-#### Flow Overview {#provider-auth-flow}
-
-1. The client fetches [ServerInfo](#info-endpoint) and discovers `provider-auth-v0`
-   in `registrationRequirements`, along with the `providerAuth` configuration object.
-2. The client constructs the authorize URL by appending query parameters to
-   `providerAuth.authorizeUrl`:
-   - `redirect_uri` — Where the provider redirects after authentication. ****MUST****
-     be an HTTPS URL (for browser-based wallets) or a native deep link / universal
-     link (for mobile apps).
-   - `state` — A CSRF protection nonce. ****MUST**** be cryptographically random.
-   - `client_id` — ****MAY**** be included as a client or wallet identifier.
-3. The client opens the authorize URL (via browser redirect, WebView, or system browser).
-4. The user authenticates with the provider. The authentication experience is
-   provider-defined and ****MAY**** include login, account creation, payment, or
-   plan selection.
-5. On success, the provider redirects back to `redirect_uri` with query parameters:
-   - `code` — An authorization code.
-   - `state` — The same `state` value from step 2.
-
-   On failure, the provider redirects back with:
-   - `error` — An error code.
-   - `error_description` — A human-readable error message.
-   - `state` — The same `state` value from step 2.
-
-6. The client validates that the returned `state` matches the value sent in step 2.
-   If the values do not match, the client ****MUST**** abort the flow.
-7. The client exchanges the authorization code for a registration token via
-   `POST {providerAuth.tokenUrl}`.
-8. The client registers DIDs via `POST /registration` using the registration token.
-
-#### Token Exchange Endpoint {#provider-auth-token-exchange}
-
-```
-POST {providerAuth.tokenUrl}
-Content-Type: application/json
-```
-
-**Request Body:**
-
-```json
-{
-  "grantType": "authorization_code",
-  "code": "<authorization_code>",
-  "redirectUri": "<redirect_uri_from_step_2>"
-}
-```
-
-| Field | Required | Description |
-|---|---|---|
-| `grantType` | Yes | ****MUST**** be `"authorization_code"`. |
-| `code` | Yes | The authorization code received from the provider redirect. |
-| `redirectUri` | Yes | The `redirect_uri` used in the authorize request. ****MUST**** match exactly. |
-
-**Response Body:**
-
-```json
-{
-  "registrationToken": "<opaque_token>",
-  "refreshToken": "<optional_refresh_token>",
-  "expiresIn": 3600,
-  "tokenType": "bearer"
-}
-```
-
-| Field | Required | Description |
-|---|---|---|
-| `registrationToken` | Yes | An opaque token used in subsequent `POST /registration` requests. |
-| `refreshToken` | No | A token that ****MAY**** be used to obtain a new registration token after expiration. Only present if `providerAuth.refreshUrl` is advertised. |
-| `expiresIn` | Yes | Token lifetime in seconds. |
-| `tokenType` | Yes | ****MUST**** be `"bearer"`. |
-
-**Error Response:**
-
-- **400:** `{ "error": "<error_code>", "errorDescription": "<message>" }` — The
-  authorization code is invalid, expired, or the `redirectUri` does not match.
-
-#### Token Refresh Endpoint {#provider-auth-token-refresh}
-
-If the server advertises `providerAuth.refreshUrl`, the client ****MAY**** refresh
-an expired registration token.
-
-```
-POST {providerAuth.refreshUrl}
-Content-Type: application/json
-```
-
-**Request Body:**
-
-```json
-{
-  "grantType": "refresh_token",
-  "refreshToken": "<refresh_token>"
-}
-```
-
-| Field | Required | Description |
-|---|---|---|
-| `grantType` | Yes | ****MUST**** be `"refresh_token"`. |
-| `refreshToken` | Yes | The refresh token from a previous token exchange or refresh response. |
-
-**Response Body:** Same shape as the [Token Exchange](#provider-auth-token-exchange) response.
-
-**Error Response:**
-
-- **400:** `{ "error": "<error_code>", "errorDescription": "<message>" }` — The
-  refresh token is invalid or expired.
-
-#### Design Notes {#provider-auth-design-notes}
-
-- **Opaque tokens:** Registration tokens are intentionally opaque to the client.
-  The server ****MAY**** implement them as JWTs, blind RSA tokens, ecash tokens,
-  or any other format. Clients ****MUST NOT**** parse or interpret the token contents.
-
-- **Privacy preservation:** Nothing in this protocol requires the provider to
-  correlate DIDs with user accounts. A privacy-preserving provider ****MAY**** issue
-  blinded tokens that cannot be linked back to the authentication session.
-
-- **Reusable tokens:** A single registration token ****MAY**** be used to register
-  multiple DIDs, subject to provider-defined limits. The server ****SHOULD****
-  document any per-token DID registration limits in its terms of service.
-
-- **Browser and native support:** The `redirect_uri` parameter supports both HTTPS
-  URLs (for browser-based wallets) and native deep links or universal links (for
-  mobile and desktop apps). Clients ****SHOULD**** use platform-appropriate redirect
-  mechanisms (e.g., custom URL schemes on mobile, loopback URLs for desktop apps).
+1. Client directs the user to `{providerAuth.authorizeUrl}` with query parameters
+   `redirect_uri` and random `state`.
+2. After user authentication/authorization, the provider returns an authorization
+   `code` and matching `state` (note: external providers typically redirect via
+   `302`; `dwn-server`'s built-in `OpenAuthHandler` at
+   `GET /provider-auth/authorize` returns HTTP `200` JSON `{ code, state?, redirectUri }`,
+   or `503` if pending codes reach 10,000).
+3. Client exchanges the code via `POST {providerAuth.tokenUrl}`:
+   ```json
+   {
+     "grantType": "authorization_code",
+     "code": "<authorization_code>",
+     "redirectUri": "<redirect_uri>"
+   }
+   ```
+   Response (`200 OK`):
+   ```json
+   {
+     "registrationToken": "<opaque_token>",
+     "refreshToken": "<optional_refresh_token>",
+     "expiresIn": 3600,
+     "tokenType": "bearer"
+   }
+   ```
+   (`refreshToken` and `expiresIn` are optional; `OpenAuthHandler` does not
+   require `grantType`, though `DwnRegistrar` includes it.)
+4. If `providerAuth.refreshUrl` is advertised, client may refresh via
+   `POST {providerAuth.refreshUrl}` with `{ "grantType": "refresh_token", "refreshToken": "<token>" }`.
+5. `dwn-server` includes a built-in `JwtProviderAuthPlugin` (HS256 secret or
+   remote JWKS verification, mapping `sub` → `accountId`) and built-in
+   `OpenAuthHandler` routes (`/provider-auth/authorize`, `/provider-auth/token`,
+   `/provider-auth/refresh`).
 
 ### Registration Submission {#registration-submission}
 
@@ -1283,8 +1079,6 @@ POST /registration
 Content-Type: application/json
 ```
 
-**Request Body:**
-
 ```json
 {
   "registrationData": {
@@ -1292,1639 +1086,304 @@ Content-Type: application/json
     "termsOfServiceHash": "e3b0c44298fc1c149afbf4c8996fb924..."
   },
   "proofOfWork": {
-    "challengeNonce": "a1b2c3d4e5f6...",
-    "responseNonce": "x7y8z9..."
+    "challengeNonce": "<64-char-hex>",
+    "responseNonce": "<64-char-hex>"
   },
   "providerAuth": {
-    "registrationToken": "..."
+    "registrationToken": "<opaque-token>"
   }
 }
 ```
 
-| Field | Required | Description |
-|---|---|---|
-| `registrationData.did` | Yes | The DID to register as a tenant |
-| `registrationData.termsOfServiceHash` | Conditional | SHA-256 hex hash of the ToS text. Required if `terms-of-service` is in the registration requirements. ****MAY**** be omitted when using `provider-auth-v0` if the provider handles ToS acceptance in the auth flow. |
-| `proofOfWork` | Conditional | Proof-of-work solution. Required if `proof-of-work-sha256-v0` is in the registration requirements. |
-| `proofOfWork.challengeNonce` | Conditional | The challenge nonce from the server. |
-| `proofOfWork.responseNonce` | Conditional | The client's solution nonce. |
-| `providerAuth` | Conditional | Provider authentication credentials. Required if `provider-auth-v0` is in the registration requirements. |
-| `providerAuth.registrationToken` | Conditional | The registration token obtained from the [Token Exchange](#provider-auth-token-exchange) endpoint. |
-
-A registration request ****MUST**** include `proofOfWork`, `providerAuth`, or both,
-depending on the server's `registrationRequirements`. If the server lists both
-`proof-of-work-sha256-v0` and `provider-auth-v0`, the client ****MUST**** satisfy
-both requirements unless the server explicitly documents that either is sufficient.
-
-**Response:**
-- **200:** `{ "success": true }` — Registration succeeded.
-- **400:** `{ "code": "...", "message": "..." }` — Validation failure (invalid
-  proof-of-work, wrong terms hash, expired challenge, invalid registration token, etc.).
-
-
-## Per-Message Payment {#per-message-payment}
-
-A [[ref:DWN Server]] ****MAY**** require payment for processing individual DWN messages.
-This enables usage-based monetization where providers charge per operation — for
-writes, reads, queries, or any combination thereof — using the payment method(s) of
-their choice.
-
-Per-message payment is ****OPTIONAL**** for both servers and clients. Servers that do
-not enable payment never return `-50402` errors and behave identically to servers
-without payment support. Clients that do not implement payment handling still work
-against free servers and receive typed errors from paid servers that they can surface
-to users or handle at the application layer.
-
-Per-message payment is orthogonal to [Tenant Registration](#tenant-registration).
-A server ****MAY**** require registration, support per-message payment, both, or neither.
-
-### Payment Flow {#payment-flow}
-
-The per-message payment flow uses a challenge/response pattern within the existing
-JSON-RPC transport:
-
-```
-Client                              DWN Server
-  │                                      │
-  │  POST / (dwn-request header)         │
-  │─────────────────────────────────────>│
-  │                                      │  Server evaluates pricing policy:
-  │                                      │  this message requires payment
-  │  JSON-RPC error response             │
-  │  code: -50402 (Payment Required)     │
-  │  data: { paymentId,                  │
-  │          paymentRequirements: [...] } │
-  │<─────────────────────────────────────│
-  │                                      │
-  │  Client selects a payment scheme     │
-  │  Client fulfills the payment         │
-  │                                      │
-  │  POST / (dwn-request header          │
-  │        + dwn-payment header)         │
-  │─────────────────────────────────────>│
-  │                                      │  Server verifies payment proof
-  │                                      │  Server processes DWN message
-  │                                      │  Server settles payment
-  │  JSON-RPC success response           │
-  │<─────────────────────────────────────│
-```
-
-1. The client sends a normal `dwn.processMessage` request.
-2. The server evaluates its pricing policy. If the message requires payment and no
-   valid payment proof is attached, the server returns a JSON-RPC error with code
-   `-50402` and a `data` field containing `PaymentRequiredData`.
-3. The client inspects the `paymentRequirements` array, selects a
-   [[ref:Payment Scheme]] it supports, and fulfills the payment using its
-   [[ref:Payment Handler]] for that scheme.
-4. The client retries the **same** request with the original `dwn-request` header
-   and an additional `dwn-payment` header containing the `PaymentProof`.
-5. The server verifies the payment proof, processes the DWN message, settles the
-   payment, and returns the normal JSON-RPC response.
-
-If the message does not require payment (e.g., the pricing policy assigns a zero
-price, or the server does not have payment enabled), the server ****MUST**** process
-the message immediately without returning `-50402`.
-
-### The `-50402` Error Response {#payment-required-error}
-
-When a server requires payment for a message, it ****MUST**** return a JSON-RPC
-error response with code `-50402`. The `data` field ****MUST**** contain a
-`PaymentRequiredData` object:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "abc-123",
-  "error": {
-    "code": -50402,
-    "message": "Payment required",
-    "data": {
-      "paymentId": "pay_7f3a8b2c-1d4e-5f6a-9b8c-7d6e5f4a3b2c",
-      "paymentRequirements": [
-        {
-          "scheme": "urn:enbox:payment:l402:v0",
-          "amount": "100",
-          "description": "RecordsWrite (1.2 MB)",
-          "invoice": "lnbc1000n1pj9...",
-          "macaroon": "0201036c6e6402..."
-        },
-        {
-          "scheme": "urn:enbox:payment:cashu:v0",
-          "amount": "100",
-          "description": "RecordsWrite (1.2 MB)",
-          "mints": ["https://mint.example.com"],
-          "unit": "sat"
-        }
-      ]
-    }
-  }
-}
-```
-
-Like all DWN-level errors, the `-50402` response is returned inside a JSON-RPC
-envelope over an HTTP `200` response. The HTTP status code reflects transport-level
-success; the JSON-RPC error code reflects the payment requirement.
-
-#### `PaymentRequiredData` Object {#payment-required-data}
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `paymentId` | `string` | Yes | A server-generated identifier for this payment challenge. The client ****MUST**** include this value in the `PaymentProof` when retrying. Servers ****SHOULD**** use a UUID v4 or similarly unique value. |
-| `paymentRequirements` | `PaymentRequirements[]` | Yes | An array of one or more payment options. Each entry describes one [[ref:Payment Scheme]] the server accepts for this message. |
-
-#### `PaymentRequirements` Object {#payment-requirements-object}
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `scheme` | `string` | Yes | The [[ref:Payment Scheme]] URN identifier (e.g., `"urn:enbox:payment:l402:v0"`). |
-| `amount` | `string` | Yes | The price in the server's base currency unit (as advertised in `ServerInfo.payment.currency`). String to avoid floating-point precision issues. |
-| `description` | `string` | No | A human-readable description of the charge (e.g., `"RecordsWrite (1.2 MB)"`). |
-
-Each [[ref:Payment Scheme]] extends `PaymentRequirements` with additional
-scheme-specific fields. See [Payment Scheme Registry](#payment-scheme-registry)
-for the fields defined by each registered scheme.
-
-### The `dwn-payment` Header {#dwn-payment-header}
-
-When retrying a request after receiving a `-50402` error, the client ****MUST****
-include a `dwn-payment` HTTP header containing a JSON-serialized `PaymentProof`
-object.
-
-The `dwn-payment` header is ****OPTIONAL****. If a server does not require payment
-for a given message, the header is ignored if present. If a server requires payment
-and the header is absent, the server returns `-50402`.
-
-::: example RecordsWrite with Payment Proof
-```http
-POST / HTTP/1.1
-Host: dwn.example.com
-Content-Type: application/octet-stream
-dwn-request: {"jsonrpc":"2.0","id":"abc-123","method":"dwn.processMessage","params":{"target":"did:example:alice","message":{...}}}
-dwn-payment: {"paymentId":"pay_7f3a8b2c-1d4e-5f6a-9b8c-7d6e5f4a3b2c","scheme":"urn:enbox:payment:l402:v0","macaroon":"0201036c6e6402...","preimage":"79852a07912..."}
-
-<binary record data>
-```
-:::
-
-#### `PaymentProof` Object {#payment-proof-object}
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `paymentId` | `string` | Yes | The `paymentId` from the `PaymentRequiredData` that prompted this payment. |
-| `scheme` | `string` | Yes | The [[ref:Payment Scheme]] URN identifier. ****MUST**** match one of the schemes offered in the `paymentRequirements`. |
-
-Each [[ref:Payment Scheme]] extends `PaymentProof` with additional scheme-specific
-fields containing the proof of payment. See [Payment Scheme Registry](#payment-scheme-registry).
-
-### Server Behavior {#payment-server-behavior}
-
-#### Pricing Policy {#pricing-policy}
-
-The server ****MUST**** evaluate a pricing policy to determine whether a message
-requires payment and how much it costs. The pricing policy is server-defined and
-****MAY**** consider any combination of:
-
-- The DWN interface and method (`Records`/`Write`, `Records`/`Query`, etc.)
-- The data size (for `RecordsWrite`)
-- The protocol URI
-- The target tenant
-- The message author
-
-If the evaluated price is zero, the server ****MUST**** process the message without
-requiring payment, even if payment is enabled.
-
-#### Payment Verification {#payment-verification}
-
-When a `dwn-payment` header is present, the server ****MUST****:
-
-1. Parse and validate the `PaymentProof` JSON.
-2. Verify that the `paymentId` matches a recently issued payment challenge.
-3. Dispatch to the [[ref:Payment Scheme]] adapter matching `proof.scheme`.
-4. Verify the proof according to the scheme's rules (e.g., macaroon signature
-   verification for L402, proof redemption check for Cashu, signature verification
-   for x402).
-5. If verification fails, the server ****MUST**** return a `-50402` error with
-   fresh `paymentRequirements`.
-
-#### Payment Settlement {#payment-settlement}
-
-After the DWN message is successfully processed, the server ****SHOULD**** settle
-the payment (e.g., broadcast an on-chain transaction for x402, or mark the payment
-as complete for L402/Cashu). Settlement is scheme-specific and ****MAY**** be
-asynchronous.
-
-If settlement fails after the message has been processed, the server ****SHOULD****
-log the failure for manual reconciliation. The server ****MUST NOT**** reverse the
-DWN message processing — the message is committed regardless of settlement outcome.
-
-#### Idempotency {#payment-idempotency}
-
-The server ****MUST**** ensure that a given `paymentId` can only be used once. If
-a client retries with the same `paymentId` after a successful payment, the server
-****MUST**** return the original response without charging again.
-
-Servers ****SHOULD**** expire unused `paymentId` values after a reasonable timeout
-(****RECOMMENDED**** 5 minutes).
-
-### Client Behavior {#payment-client-behavior}
-
-#### Detection {#payment-detection}
-
-Clients ****MUST**** check for error code `-50402` in JSON-RPC error responses.
-When detected:
-
-1. Parse the `error.data` field as a `PaymentRequiredData` object.
-2. Iterate the `paymentRequirements` array.
-3. For each entry, check whether a registered [[ref:Payment Handler]] supports
-   the `scheme`.
-4. If a handler is found, invoke it to produce a `PaymentProof`.
-5. Retry the original request with the `dwn-payment` header.
-
-Clients ****MUST NOT**** retry more than once per `-50402` response to prevent
-infinite payment loops. If the retry also returns `-50402`, the client ****MUST****
-surface the error to the application layer.
-
-#### No Handler Available {#payment-no-handler}
-
-If the client does not have a [[ref:Payment Handler]] for any of the offered
-schemes, the client ****SHOULD**** surface the `PaymentRequiredData` to the
-application layer. This allows applications to present payment options to the user
-or handle the error appropriately.
-
-Clients ****MUST NOT**** silently drop `-50402` errors. The error ****MUST**** be
-propagated to the caller.
-
-#### Feature Detection {#payment-feature-detection}
-
-Clients ****MAY**** inspect the `payment` field in [ServerInfo](#server-info-object)
-to determine payment capabilities before sending messages. This allows clients to:
-
-- Discover which [[ref:Payment Scheme]]s a server accepts.
-- Display pricing information to users.
-- Pre-select a DWN provider based on cost.
-
-Clients ****MUST**** check `payment.methods` to determine the payment flow model.
-If the client does not recognize any of the listed methods, it ****SHOULD NOT****
-attempt to handle `-50402` errors from that server.
-
-### Payment Methods {#payment-methods}
-
-The `payment.methods` array in [ServerInfo](#server-info-object) declares which
-payment flow models the server supports. This is the primary feature detection
-signal for clients.
-
-| Value | Description |
-|---|---|
-| `per-message-payment-v0` | Per-message challenge/response as defined in this section. The server returns `-50402` on individual messages that require payment. |
-
-::: note
-Future specifications may define additional methods such as `prepaid-balance-v0`
-(deposit credits, deduct per message) or `subscription-v0` (recurring payment for
-a quota). Methods are orthogonal to each other and to
-[registration requirements](#registration-requirement-values).
-:::
-
-### Payment Scheme Registry {#payment-scheme-registry}
-
-[[ref:Payment Scheme]] identifiers ****MUST**** use the URN format
-`urn:enbox:payment:<scheme-name>:<version>` to ensure global uniqueness and prevent
-collisions between independently developed schemes.
-
-Third parties ****MAY**** define their own schemes using their own URN namespace
-(e.g., `urn:example:payment:stripe:v0`). Servers and clients negotiate scheme
-support through the `paymentRequirements` array — no central registry is required
-for interoperability.
-
-The following schemes are defined by this specification:
-
-#### `urn:enbox:payment:l402:v0` — Lightning L402 {#scheme-l402}
-
-L402 combines [macaroons](https://research.google/pubs/macaroons-cookies-with-contextual-caveats-for-decentralized-authorization-in-the-cloud/)
-(bearer authentication tokens with embedded caveats) and Lightning Network invoices.
-The client pays a Lightning invoice to obtain a preimage, then presents the macaroon
-and preimage together as proof of payment.
-
-**Additional `PaymentRequirements` fields:**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `invoice` | `string` | Yes | A BOLT-11 Lightning invoice for the required amount. |
-| `macaroon` | `string` | Yes | A hex-encoded macaroon with the invoice's payment hash as a caveat. |
-
-**Additional `PaymentProof` fields:**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `macaroon` | `string` | Yes | The macaroon from the payment requirements (hex-encoded). |
-| `preimage` | `string` | Yes | The Lightning payment preimage obtained by paying the invoice (hex-encoded). |
-
-**Verification:** The server verifies the macaroon signature chain using its root
-key, validates all caveats (amount, expiry, etc.), and confirms that
-`SHA-256(preimage) == payment_hash` from the macaroon's payment hash caveat.
-
-**Settlement:** Settlement is atomic with payment. The Lightning payment transfers
-value when the client obtains the preimage. No additional settlement step is required.
-
-::: example L402 Payment Requirements
-```json
-{
-  "scheme": "urn:enbox:payment:l402:v0",
-  "amount": "100",
-  "description": "RecordsQuery",
-  "invoice": "lnbc1000n1pj9nwz2pp5xt7...",
-  "macaroon": "0201036c6e640204..."
-}
-```
-:::
-
-::: example L402 Payment Proof
-```json
-{
-  "paymentId": "pay_7f3a8b2c-1d4e-5f6a-9b8c-7d6e5f4a3b2c",
-  "scheme": "urn:enbox:payment:l402:v0",
-  "macaroon": "0201036c6e640204...",
-  "preimage": "79852a0791225dee00be0a6cf31a1619782c21d35995e118bfc74ad812174035"
-}
-```
-:::
-
-#### `urn:enbox:payment:cashu:v0` — Cashu Ecash {#scheme-cashu}
-
-[Cashu](https://cashu.space) ecash tokens are bearer instruments — cryptographic
-proofs of value issued by a mint. The client sends ecash proofs that the server
-redeems with the mint. Cashu provides instant settlement, privacy (blind-signed
-tokens are unlinkable to the payer), and support for very small amounts.
-
-**Additional `PaymentRequirements` fields:**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `mints` | `string[]` | Yes | Accepted mint URLs. The client ****MUST**** provide proofs from one of these mints. |
-| `unit` | `string` | No | The Cashu unit (e.g., `"sat"`). Defaults to the server's `payment.currency`. |
-
-**Additional `PaymentProof` fields:**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `tokens` | `string` | Yes | A Cashu token string (`cashuA...` or `cashuB...` encoded) containing proofs totaling at least the required amount. |
-
-**Verification:** The server decodes the Cashu token, verifies the mint URL is in
-the accepted list, checks proof state with the mint (unspent), and verifies the
-total proof amount meets or exceeds the required amount.
-
-**Settlement:** The server redeems the proofs with the mint (swap or receive). This
-is instant and atomic — once redeemed, the value is transferred.
-
-::: example Cashu Payment Requirements
-```json
-{
-  "scheme": "urn:enbox:payment:cashu:v0",
-  "amount": "100",
-  "description": "RecordsWrite (1.2 MB)",
-  "mints": ["https://mint.example.com"],
-  "unit": "sat"
-}
-```
-:::
-
-::: example Cashu Payment Proof
-```json
-{
-  "paymentId": "pay_7f3a8b2c-1d4e-5f6a-9b8c-7d6e5f4a3b2c",
-  "scheme": "urn:enbox:payment:cashu:v0",
-  "tokens": "cashuAeyJ0b2tlbiI6W3sicH..."
-}
-```
-:::
-
-#### `urn:enbox:payment:x402-exact:v0` — x402 Exact (EVM/SVM) {#scheme-x402}
-
-[x402](https://github.com/coinbase/x402) uses signed on-chain token transfer
-authorizations. The client signs an EIP-3009 `transferWithAuthorization` (EVM) or
-equivalent authorization (SVM) that a facilitator service broadcasts and settles
-on-chain.
-
-**Additional `PaymentRequirements` fields:**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `network` | `string` | Yes | Chain identifier (e.g., `"eip155:8453"` for Base, `"solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"` for Solana mainnet). |
-| `asset` | `string` | Yes | Token contract address (EVM) or mint address (SVM). |
-| `payTo` | `string` | Yes | The provider's receiving address. |
-| `maxTimeoutSeconds` | `number` | No | Maximum time the server will wait for settlement. Defaults to `60`. |
-| `extra` | `object` | No | Additional chain-specific metadata (e.g., `{ "name": "USDC", "version": "2" }` for EIP-712 domain). |
-
-**Additional `PaymentProof` fields:**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `payload` | `string` | Yes | Base64-encoded x402 `PaymentPayload` containing the signed authorization. |
-
-**Verification:** The server forwards the payload to an x402 facilitator's
-`/verify` endpoint, or verifies the EIP-712 signature locally.
-
-**Settlement:** The server forwards the payload to the facilitator's `/settle`
-endpoint. The facilitator broadcasts the on-chain transaction and returns the
-transaction hash.
-
-::: note
-The x402 scheme requires an external facilitator service for settlement. The
-facilitator broadcasts the transaction and pays gas fees. See the
-[x402 specification](https://github.com/coinbase/x402) for facilitator API details.
-:::
-
-::: example x402 Payment Requirements
-```json
-{
-  "scheme": "urn:enbox:payment:x402-exact:v0",
-  "amount": "10000",
-  "description": "RecordsWrite (1.2 MB)",
-  "network": "eip155:8453",
-  "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-  "payTo": "0x1234567890abcdef1234567890abcdef12345678",
-  "maxTimeoutSeconds": 60,
-  "extra": { "name": "USDC", "version": "2" }
-}
-```
-:::
-
-### Design Notes {#payment-design-notes}
-
-- **Transport-layer concern:** Per-message payment is a transport/server concern,
-  not a DWN protocol concern. The DWN specification and the DWN SDK do not need
-  to be aware of payment. Payment requirements and proofs are exchanged via HTTP
-  headers and JSON-RPC error codes, outside the DWN message envelope.
-
-- **Multiple schemes simultaneously:** A server ****MAY**** offer multiple payment
-  schemes in a single `paymentRequirements` array. The client selects the first
-  scheme it supports. This allows providers to accept both Lightning and Cashu (or
-  any combination) without requiring clients to support all methods.
-
-- **Payment is optional on both sides:** Servers that don't enable payment never
-  return `-50402`. Clients that don't implement payment handlers work against free
-  servers and receive typed errors from paid servers. Neither side breaks when the
-  other doesn't support payment.
-
-- **Pricing granularity:** The pricing policy is server-defined and not specified
-  in this document. A server ****MAY**** charge flat per-message rates, per-byte
-  rates for writes, different rates for different interfaces, or implement dynamic
-  pricing. The `PaymentRequirements.amount` reflects the evaluated price for the
-  specific message that triggered the `-50402`.
-
-- **Data-bearing retries:** When a `RecordsWrite` with data receives a `-50402`,
-  the client ****MUST**** resend both the `dwn-request` header and the request
-  body (binary data) on retry, along with the `dwn-payment` header. The server
-  ****MUST NOT**** cache request bodies across the challenge/response boundary.
-
+- **Precedence**: `providerAuth` and `proofOfWork` are evaluated as mutually
+  exclusive alternatives: if `request.providerAuth?.registrationToken !== undefined`,
+  provider-auth registration runs; otherwise if `request.proofOfWork === undefined`,
+  the server rejects with HTTP `400` (`RegistrationRequestMissingCredentials`);
+  otherwise proof-of-work registration runs.
+- **Terms of Service**: Whenever the server has a Terms of Service configured,
+  clients ****SHOULD**** include `registrationData.termsOfServiceHash` even when
+  registering via `providerAuth` so active-tenant checks match the configured
+  ToS hash. (Note: `@enbox/auth`'s `registerPair` currently omits
+  `termsOfServiceHash` on provider-auth registrations.)
+- **Responses**:
+  - **200**: `{ "success": true }`
+  - **400**: `{ "code": "<DwnServerErrorCode>", "message": "<code: detail>" }`
+  - **500**: `{ "success": false }` (malformed JSON bodies currently fail before
+    the JSON error handler and return plain-text HTTP `500`)
 
 ## Sync Orchestration {#sync-orchestration}
 
-The DWN specification defines the `MessagesSync` interface and the Sparse Merkle Tree
-data structure for set reconciliation. This section specifies how a [[ref:DWN Client]]
-(typically an agent or another DWN Server) ****SHOULD**** orchestrate the sync process
-between two DWN nodes.
+Synchronization between DWN nodes uses durable ordered message feeds
+(`MessagesQuery`, `MessagesSubscribe`, `MessagesRead`), role-authorized context
+support (`RecordsRead` with `includeReplicationSupport: true`), and
+`dwn.applyReplicatedMessage`. (`MessagesSync` and Sparse Merkle Trees are not
+used.)
 
-::: note
-The `MessagesSync` message format, SMT structure, and tree membership rules are
-defined in the [DWN specification](https://github.com/enboxorg/dwn-spec). This
-section specifies the orchestration protocol that uses those primitives.
-:::
+### Replication Progress State {#sync-progress-state}
 
-### Sync Roles {#sync-roles}
+- Progress tracking uses source-local [[ref:Progress Token]] values valid only
+  within their `(streamId, epoch)` domain.
+- Position comparisons ****MUST**** be numeric (BigInt-safe) and only within the
+  same `(streamId, epoch)` domain.
+- Clients persist independent pull (remote → local) and push (local → remote)
+  checkpoints per replication link `(tenantDid, remoteEndpoint, projectionId, authorizationEpoch)`.
+- Servers keep only connection-local flow-control state in memory and never
+  store durable per-peer sync checkpoints.
 
-In a sync session, there are two participants:
+### Authorization and Scopes {#sync-authorization}
 
-- **Local node:** The DWN instance the client controls directly (typically via in-process calls).
-- **Remote node:** The DWN instance the client communicates with over the network
-  (via the transports defined in this specification).
+- **Owner / Delegate bidirectional sync**: Uses unified **`Messages` / `Read`**
+  permission grants covering `MessagesQuery`, `MessagesSubscribe`, and
+  `MessagesRead` for either `full` (`filters: []`) or `moduleSet`
+  (`{ module: uri }` per module) scopes.
+- **Role-authorized pull-only context sync**: Uses `moduleRole` with exact
+  `Records` filters (`{ interface: "Records", module, modulePath, contextIdPrefix }`)
+  for `context` scopes, bootstrapping closure and encryption control via
+  `RecordsRead` with `includeReplicationSupport: true`.
 
-Sync is bidirectional: the client performs a **pull** phase (remote → local) and a
-**push** phase (local → remote). Both phases use the same `MessagesSync` protocol
-but in opposite directions.
+### Pull, Push, and Live Flows {#sync-flows}
 
-### Authorization for Sync {#sync-authorization}
+1. **Startup paired snapshot baseline (owner/delegate)**: Open cursorless
+   `MessagesSubscribe` on both remote and local DWNs; if their reply
+   `{ head, fingerprint }` snapshots match with valid heads, commit both
+   checkpoints immediately without paging `MessagesQuery`.
+2. **Pull (remote → local)**: Page `MessagesQuery` (default `limit: 100`) from
+   the pull checkpoint; dynamically toggle `cidsOnly` based on missing CIDs;
+   fetch missing large payloads or missing `DependencyRef`s via `MessagesRead`
+   (or `RecordsRead` with `includeReplicationSupport` for role links); order
+   closures topologically (up to 128 passes) and admit locally via
+   `Dwn.applyReplicatedMessage` (optionally with
+   `includeMaterializationConfirmation: true` over local-node HTTP).
+3. **Push (local → remote)**: Page local `MessagesQuery` from the push
+   checkpoint and send entries via **`dwn.applyReplicatedMessage`** over HTTP
+   framed bodies (or over pooled WebSockets for zero-data, `ancestryOnly: true`,
+   or small inline `params.encodedData` writes whose complete UTF-8 JSON-RPC
+   frame is `<= 64 KiB`). Remote DWN is the dependency authority:
+   `Incomplete { missing }` triggers fetching missing local dependencies and
+   retrying; quota rejections (`-32600` with `TenantMessageQuotaExceeded` /
+   `TenantStorageQuotaExceeded`) create backed-off quota blocks rather than dead
+   letters.
+4. **Live updates & periodic settle checks**: Sync opens and reconnects live
+   `MessagesSubscribe` streams **cursorless** (never relying on cursor-mode WS
+   catch-up replay; instead scheduling durable pull/push reconciliation passes
+   on reconnect to close any gap). Complete remote live socket events are
+   admitted in order, gating `rpc.ack` on handler completion; local live writes
+   coalesce a push pass from the push checkpoint; periodic settle checks run
+   every **5 minutes** by default (`"5m"`), probing fingerprints first
+   (`cidsOnly: true, limit: 1`) before reconciling.
 
-To sync with a remote DWN, the client ****MUST**** have authorization to perform
-the following operations on the remote node:
-
-- `MessagesSync` — To compare tree state and enumerate leaves.
-- `MessagesRead` — To fetch the full content of missing messages.
-
-For pushing messages, the client ****MUST**** have authorization to process the
-messages being sent (e.g., `RecordsWrite` permission if pushing record writes).
-
-These permissions are typically obtained via [[ref:Permission Grants]]. For
-protocol-scoped sync, the grants ****MUST**** include:
-
-| Scope | Purpose |
-|---|---|
-| `Messages` / `Sync` scoped to protocol | Compare tree state for the protocol |
-| `Messages` / `Read` scoped to protocol | Fetch missing messages |
-| `Protocols` / `Query` scoped to protocol | Verify protocol definition availability |
-
-::: note
-A future revision of the DWN specification may simplify these into a unified
-`Messages` / `Read` scope that covers sync, read, and subscribe operations for
-a given protocol — mirroring how protocol `$actions` already treats `read` as a
-unified action covering read, query, subscribe, and count.
-:::
-
-### Pull Sync Flow {#pull-sync-flow}
-
-Pull sync fetches messages from the remote node that the local node is missing.
-
-**Phase 1 — Root Comparison:**
-
-1. Send `MessagesSync` with `action: "root"` to the remote node (optionally with
-   `protocol` for scoped sync).
-2. Query the local node for its root hash.
-3. If the root hashes are identical, the nodes are in sync — skip to push sync.
-
-**Phase 2 — Tree Walk:**
-
-1. Starting from prefix `""`, send `MessagesSync` with `action: "subtree"` to both
-   the remote and local nodes.
-2. Compare the subtree hashes:
-   - If hashes match: the subtree is identical, skip it.
-   - If one side returns the default hash (empty): all entries under this prefix
-     exist only on the other side. Switch to `action: "leaves"` to enumerate them.
-   - If both sides differ: extend the prefix by appending `"0"` and `"1"` and
-     recurse on both children.
-3. Continue until reaching the configured walk depth (****RECOMMENDED**** depth
-   of 16), then switch to `action: "leaves"`.
-
-**Phase 3 — Leaf Enumeration and Set Difference:**
-
-1. For each divergent prefix, send `MessagesSync` with `action: "leaves"` to both
-   nodes.
-2. Compute the set difference: `messageCids` present on the remote but not locally.
-3. For each missing `messageCid`, send `MessagesRead` with `{ messageCid }` to
-   the remote node to retrieve the full message and any associated data.
-
-**Phase 4 — Message Application:**
-
-1. Process each fetched message on the local node via `processMessage`.
-2. Messages ****MUST**** be applied respecting dependency order as defined in the
-   DWN specification's [Sync Flow](https://github.com/enboxorg/dwn-spec) section:
-   - `ProtocolsConfigure` before records referencing that protocol.
-   - Parent records before child records.
-   - Initial `RecordsWrite` before updates or deletes for the same record.
-   - Permission grants before messages that reference them.
-3. Implementations ****SHOULD**** use topological sorting or multiple passes with
-   retry to satisfy ordering constraints.
-
-### Push Sync Flow {#push-sync-flow}
-
-Push sync sends local messages to the remote node that the remote is missing.
-
-The flow is identical to pull sync but with reversed roles:
-
-1. Compare root hashes (local vs. remote).
-2. Walk the tree to identify divergent subtrees.
-3. Enumerate leaves and compute the set difference: `messageCids` present locally
-   but not on the remote.
-4. For each missing message, retrieve it from the local node and send it to the
-   remote node via `dwn.processMessage` over the [HTTP transport](#http-transport).
-
-::: note
-For `RecordsWrite` messages with data, the push ****MUST**** use the HTTP transport
-since the WebSocket transport does not support data payloads.
-:::
-
-### Scoped Sync {#scoped-sync}
-
-Sync ****MAY**** be scoped to a specific protocol by including the `protocol` field
-in `MessagesSync` messages. This enables selective synchronization — for example,
-syncing only a specific application's data between nodes without transferring
-unrelated records.
-
-When performing scoped sync, all `MessagesSync` messages in the session ****MUST****
-include the same `protocol` value. The resulting tree comparison operates on the
-per-protocol SMT rather than the global tree.
-
-### Sync Scheduling {#sync-scheduling}
-
-Implementations ****SHOULD**** perform sync on a periodic schedule.
-A ****RECOMMENDED**** default interval is 2 minutes.
-
-Implementations ****MAY**** also trigger sync on demand — for example, after a local
-write, after receiving a subscription event, or in response to a user action.
-
-Implementations ****SHOULD**** implement backoff when repeated sync attempts find
-no changes, and ****SHOULD**** increase sync frequency when changes are detected.
-
-
-## Local Transport {#local-transport}
+## Local Transport (Local Node Profile) {#local-transport}
 
 ### Overview {#local-transport-overview}
 
-The HTTP and WebSocket transports defined in earlier sections are designed for
-communication over the public network between remote parties. However, several
-important deployment scenarios involve [[ref:DWN Client]] to [[ref:DWN Server]]
-communication between processes on the **same device**:
+`dwn-server` and `@enbox/local-node` provide an opt-in **Local Node Profile**
+(`localNodeProfileEnabled: true` / `DWN_LOCAL_NODE_PROFILE=true`) for on-device
+HTTP and WebSocket communication between browser apps, CLI tools, or desktop
+apps and a local DWN process.
 
-- A native mobile application communicating with a [[ref:DWN Server]] running as
-  a separate app on the same phone or tablet.
-- A browser extension bridging web application JavaScript to a native
-  [[ref:DWN Server]] process.
-- A desktop application communicating with a locally running [[ref:DWN Server]].
+All local traffic reuses the standard JSON-RPC 2.0 wire format, binary HTTP
+framing (`application/vnd.enbox.dwn-rpc`), and WebSocket subscriptions, layered
+with loopback isolation and origin-bound pairing authentication. `@enbox/local-node`
+inherits default `dwn-server` rate limits as well as `forwardingEnabled: true`
+and `deliveryEnabled: true`.
 
-These scenarios share a common requirement: the client and server are
-co-located on the same operating system, but run in separate process sandboxes
-with no shared memory. The messages exchanged are identical to those carried
-over HTTP or WebSocket — the same [[ref:JSON-RPC Envelope]] format, the same
-DWN message semantics, and the same authorization model — but the connection
-establishment, discovery, and authentication mechanisms differ.
+### Loopback Isolation and Anti-DNS-Rebinding {#local-loopback}
 
-This section defines [[ref:Local Transport]] bindings for these scenarios.
-Because operating systems provide fundamentally different inter-process
-communication primitives, this specification defines platform-specific
-bindings rather than a single universal mechanism. All bindings share the
-JSON-RPC wire format and DWN message-level authorization as their common
-foundation.
+When `localNodeProfileEnabled` is enabled:
+- **Bind enforcement**: The server defaults `hostname` to `127.0.0.1` and
+  refuses to start unless bound to a loopback address (`localhost`, `::1`, or
+  `127.0.0.0/8`, stripping an optional trailing `.` and rejecting `*.localhost`).
+- **`Host` header validation**: Every incoming HTTP request and WebSocket
+  upgrade ****MUST**** carry a loopback `Host` hostname; non-loopback `Host`
+  headers are rejected with HTTP **`403 Forbidden`** to defeat DNS-rebinding
+  attacks.
+- **Strict CORS**: Wildcard `*` is disabled; `Access-Control-Allow-Origin`
+  reflects `Origin` (with `Vary: Origin`) only for `/info`, `/local/pair`,
+  matching-origin `/local/pair/:requestId`, or already-paired origins.
+- **Public vs. protected routes**: Only `OPTIONS *`, `GET /info`,
+  `POST /local/pair`, and `GET /local/pair/:requestId` are unauthenticated.
+  All other routes — including WebSocket upgrades, `/`, `/local/status`,
+  `/health`, REST routes, `/registration*`, `/provider-auth/*`, `/connect/*`,
+  `/admin*`, and `/metrics` — require valid local-node authentication (HTTP
+  `401` `{"error":"Unauthorized"}` otherwise).
 
-The following bindings are defined:
+### Pairing and Session Authentication {#local-pairing}
 
-| Binding | Platform | Mechanism | Subscriptions |
-|---------|----------|-----------|---------------|
-| [iOS Local Transport](#ios-local-transport) | iOS, macOS | Localhost HTTP/WebSocket | Yes (WebSocket) |
-| [Android Local Transport](#android-local-transport) | Android | AIDL Bound Service | Yes (callback interface) |
-| [Browser Extension Transport](#browser-extension-transport) | Cross-platform | Extension messaging to native handler | Yes (persistent port) |
+Tokens are 32 random bytes encoded as base64url and verified with constant-time
+comparison (`timingSafeEqual`):
+
+- **Browser origins** authenticate via `Authorization: Bearer <token>` (HTTP &
+  WS) or `?localNodeToken=<token>` (WS upgrade), and the session is bound to the
+  exact `http(s)` `Origin` header (`origin === session.origin`).
+- **CLI / native processes** authenticate using the origin-less `localNodeToken`
+  from the [[ref:Discovery File]], and ****MUST NOT**** send an `Origin` header
+  (`origin === undefined`).
+
+#### Pairing Endpoints
+
+1. **`POST /local/pair`**:
+   - Requires a valid `http:` or `https:` `Origin` header (`400` otherwise);
+     request body is ignored (clients such as `@enbox/auth` send `{}`).
+   - Coalesces duplicate pending requests for the same origin **before**
+     rate-limiting; new requests are rate-limited to **5 attempts per 60 seconds**
+     per origin (`429` + `Retry-After`).
+   - Auto-approves synchronously if the origin is in `localNodeAllowedOrigins`,
+     and expires after **5 minutes** (`300_000` ms).
+   - Response (`200 OK`): `{ "requestId": "<uuid>", "status": "pending" }`
+     (returned with `"pending"` even when auto-approved; clients ****MUST****
+     poll `GET /local/pair/:requestId` to retrieve the issued token).
+2. **`GET /local/pair/:requestId`**:
+   - Empty `:requestId` returns HTTP `400` (`{"error":"Pairing request ID is required."}`).
+   - Requires an `Origin` header matching the initiating origin (`404` otherwise).
+   - Response (`200 OK`):
+     `{ "status": "pending" | "approved" | "denied" | "expired", "origin": "<origin>", "token"?: "<32-byte-base64url>" }`.
+   - On `"approved"`, **`token` is returned ONCE** (the first successful poll
+     marks `tokenReturned = true`; subsequent polls omit `token`).
+   - Terminal requests are retained for 5 minutes before pruning.
+3. **`GET /local/status`** (authenticated):
+   - Response (`200 OK`): `{ "localNode": true, "origin"?: "<origin>", "paired": true }`.
+   - Used for passive revalidation of stored browser pairings.
+
+#### Persistence, Revocation, and Local-Only Capabilities
+
+- `@enbox/local-node` persists approved browser sessions at
+  `~/.enbox/local-node-sessions.json` (`0o600` on POSIX, `{ version: 1, sessions: [{ createdAt, origin, token }] }`)
+  and creates an ephemeral origin-less `localNodeToken` for CLI/native apps.
+- Session revocation is host-local programmatic only (`DwnServer.revokeLocalNodePairingToken`
+  / `LocalNode.revokePairingToken`; no HTTP `/local/revoke` route exists).
+  Revoking a session token deletes it and **immediately closes all live
+  WebSocket connections** authenticated by that token (using default close code
+  `1000` without a custom reason).
+- `dwn.applyReplicatedMessage` permits `includeMaterializationConfirmation: true`
+  only over HTTP on authenticated Local Node Profile connections.
 
 ### Local Discovery {#local-discovery}
 
-Before a [[ref:DWN Client]] can communicate with a local [[ref:DWN Server]],
-it must discover whether a server is available and how to connect to it. This
-section defines discovery mechanisms that apply across platform bindings.
+#### Discovery File (`~/.enbox/dwn.json`) {#discovery-file}
 
-#### Discovery File {#discovery-file}
+`@enbox/local-node` listens on the first available port in `55500..55509, 3000`
+and writes `~/.enbox/dwn.json` (`0o600` permissions on POSIX platforms):
 
-A local [[ref:DWN Server]] process ****MAY**** write a [[ref:Discovery File]] to
-advertise its availability. The file ****MUST**** be located at a well-known
-path and ****MUST**** contain a JSON object with the following properties:
-
-| Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `endpoint` | `string` | Yes | The URL at which the server is listening (e.g., `http://127.0.0.1:55500`). |
-| `pid` | `number` | No | The operating system process ID of the server. Clients ****SHOULD**** verify the process is alive before connecting. |
-| `capabilities` | `array` | No | An array of strings indicating server capabilities (e.g., `["http", "ws"]`). |
-
-The default file path is:
-
-| Platform | Path |
-|----------|------|
-| macOS / Linux | `~/.enbox/dwn.json` |
-| Windows | `%APPDATA%\enbox\dwn.json` |
-| iOS / Android | Not applicable (no shared filesystem between apps from different developers). |
-
-::: example Discovery File
 ```json
 {
   "endpoint": "http://127.0.0.1:55500",
   "pid": 12345,
-  "capabilities": ["http", "ws"]
-}
-```
-:::
-
-The server ****MUST**** remove or update the [[ref:Discovery File]] when it shuts
-down or changes its listening address. Clients ****SHOULD**** treat a stale
-discovery file (where `pid` refers to a dead process) as absent.
-
-#### Well-Known Port Probing {#well-known-port-probing}
-
-When no [[ref:Discovery File]] is available (or on platforms where filesystem-based
-discovery is not possible), clients ****MAY**** probe a set of well-known ports on
-the loopback interface.
-
-The well-known port set is:
-
-- `55500` through `55509` (inclusive)
-- `3000` (development convenience)
-
-For each candidate port, the client ****SHOULD**** send a `GET` request to
-`http://127.0.0.1:{port}/info` and validate that the response conforms to the
-[ServerInfo](#server-info-object) schema. Clients ****MUST**** try `127.0.0.1`
-rather than `localhost` to avoid DNS resolution ambiguity.
-
-Clients ****SHOULD**** probe ports sequentially and stop at the first valid
-response. Clients ****SHOULD**** cache a successful discovery result with a
-short TTL (****RECOMMENDED**** 10 seconds) to avoid repeated probing.
-
-#### Bonjour / mDNS Discovery {#bonjour-discovery}
-
-On Apple platforms (iOS, macOS), local [[ref:DWN Servers]] ****MAY**** advertise
-their availability via Bonjour (mDNS/DNS-SD) using the following service type:
-
-```
-_dwn._tcp
-```
-
-The TXT record ****SHOULD**** include the following keys:
-
-| Key | Description |
-|-----|-------------|
-| `did` | The DID of the primary tenant hosted by the server. |
-| `path` | The URL path prefix, if not `/` (default: `/`). |
-
-Clients ****MAY**** discover services using `NWBrowser` (Network framework) or
-equivalent platform APIs. Note that on iOS 14+, Bonjour discovery triggers a
-one-time Local Network permission dialog.
-
-#### Android Service Discovery {#android-service-discovery}
-
-On Android, [[ref:DWN Servers]] that expose an AIDL Bound Service (see
-[Android Local Transport](#android-local-transport)) ****MUST**** declare an
-`<intent-filter>` with the following action:
-
-```
-org.enbox.dwn.BIND_DWN_SERVICE
-```
-
-Clients ****MAY**** discover available DWN services using `PackageManager.queryIntentServices()`
-with this action. When multiple services are available, the client ****SHOULD****
-present a chooser or use a preference-based selection.
-
-#### URL Scheme Discovery (`dwn://register`) {#url-scheme-discovery}
-
-In browser environments, web applications cannot read the
-[Discovery File](#discovery-file) and ****MAY**** be blocked by CORS when
-attempting [Well-Known Port Probing](#well-known-port-probing). To bridge this
-gap, a native [[ref:DWN Server]] application ****MAY**** register a custom URL
-scheme handler for the `dwn` scheme. The `dwn://register` URL triggers a
-redirect-based handshake that delivers the server's local endpoint to the
-requesting web application.
-
-##### Protocol Flow {#url-scheme-protocol-flow}
-
-```
-  Web App                          OS / DWN Server App             Browser
-  ───────                          ──────────────────              ───────
-     │                                      │                        │
-     │ 1. window.open(                      │                        │
-     │    "dwn://register?callback=         │                        │
-     │     https://app.example/cb")         │                        │
-     │ ─────────────────────────────────►   │                        │
-     │                                      │                        │
-     │         2. OS routes dwn:// URL      │                        │
-     │            to registered handler     │                        │
-     │                                      │                        │
-     │         3. Handler parses callback,  │                        │
-     │            builds redirect URL:      │                        │
-     │            https://app.example/cb    │                        │
-     │            #eyJ...base64url...       │                        │
-     │                                      │                        │
-     │                                      │ 4. Open redirect URL   │
-     │                                      │ ──────────────────────►│
-     │                                      │                        │
-     │         5. Browser loads callback    │                        │
-     │            page with payload in #    │                        │
-     │ ◄────────────────────────────────────┼────────────────────────│
-     │                                      │                        │
-     │ 6. Read payload from                 │                        │
-     │    location.hash, validate,          │                        │
-     │    cache endpoint                    │                        │
-```
-
-1. The web application constructs a `dwn://register` URL:
-
-   ```
-   dwn://register?callback=<percent-encoded-callback-url>
-   ```
-
-   and opens it (e.g., via `window.open()`). The `callback` parameter is a URL
-   that the handler will redirect back to — typically the current page.
-
-2. The operating system routes the `dwn://` URL to the registered scheme handler
-   (e.g., a desktop DWN app such as Electrobun DWN).
-
-3. The handler parses the `callback` query parameter, constructs a
-   `DwnDiscoveryPayload`, and builds a redirect URL by appending the base64url-encoded
-   payload as the URL fragment (`#`) of the callback URL.
-
-4. The handler opens the redirect URL in the user's default browser.
-
-5. The browser navigates to the callback URL. The payload is in the fragment,
-   which is not sent to the server — it is only accessible to client-side
-   JavaScript via `location.hash`.
-
-6. The web application reads and decodes the payload from the fragment, validates
-   that the endpoint is a loopback address, and caches it for subsequent DWN
-   requests. The fragment ****SHOULD**** be cleared after reading (e.g., via
-   `history.replaceState`) to prevent double-reads on page refresh.
-
-##### `dwn://register` URL Format {#dwn-register-url-format}
-
-```
-dwn://register?callback=<percent-encoded-url>
-```
-
-| Component | Value |
-|-----------|-------|
-| Scheme | `dwn` |
-| Host/Path | `register` |
-| Query: `callback` | Required. A percent-encoded URL that the handler redirects back to. |
-
-##### DwnDiscoveryPayload {#dwn-discovery-payload}
-
-The payload is a JSON object, serialized and encoded as unpadded base64url
-(RFC 4648 §5), placed in the URL fragment of the callback redirect.
-
-```json
-{
-  "endpoint": "http://127.0.0.1:55500"
+  "capabilities": ["http", "ws"],
+  "localNodeToken": "<32-byte-base64url-cli-token>"
 }
 ```
 
 | Property | Type | Required | Description |
-|----------|------|----------|-------------|
-| `endpoint` | `string` | Yes | The base URL of the running local [[ref:DWN Server]]. |
-
-The payload is intentionally minimal. All additional server metadata (version,
-WebSocket support, capabilities) is obtained from the standard
-[ServerInfo](#server-info-object) endpoint at `GET {endpoint}/info`.
-
-##### Security Requirements {#url-scheme-security}
-
-- **Loopback validation:** The receiving web application ****MUST**** validate
-  that the `endpoint` in the decoded payload points to a loopback address
-  (`127.0.0.1`, `[::1]`, or `localhost`). Accepting non-loopback endpoints would
-  allow a malicious `dwn://register` handler to redirect agent traffic to a
-  remote server.
-
-- **Fragment-only transport:** The payload ****MUST**** be placed in the URL
-  fragment (`#`), not in query parameters. Fragments are not sent to the server
-  in HTTP requests, preventing the endpoint from leaking to intermediaries.
-
-- **No handler detection:** There is no reliable cross-browser API to detect
-  whether a `dwn://` scheme handler is installed. If no handler is registered,
-  `window.open()` will silently fail or show an OS-level error dialog. Clients
-  ****SHOULD**** first attempt [Well-Known Port Probing](#well-known-port-probing)
-  to check if a local DWN is already reachable before triggering the
-  `dwn://register` flow.
-
-- **Fragment clearing:** After reading the payload from the URL fragment, the
-  client ****SHOULD**** clear the fragment (e.g., via `history.replaceState()`)
-  to prevent re-reading the stale payload if the user refreshes the page.
-
-##### Handler Implementation Requirements {#url-scheme-handler-requirements}
-
-A DWN server application that registers the `dwn` URL scheme ****MUST****:
-
-1. Parse the incoming URL and extract the `callback` query parameter. If the
-   URL does not match the `dwn://register?callback=...` format, the handler
-   ****SHOULD**** ignore it.
-
-2. Construct a `DwnDiscoveryPayload` containing its local listening endpoint.
-
-3. Build the redirect URL: `{callback}#{base64url(JSON.stringify(payload))}`.
-   Any existing fragment on the callback URL ****MUST**** be stripped before
-   appending the payload fragment.
-
-4. Open the redirect URL in the user's default browser.
-
-##### Caching and Persistence {#url-scheme-caching}
-
-After a successful `dwn://register` handshake, the client ****SHOULD**** persist
-the discovered endpoint (e.g., in `localStorage`) so that subsequent page loads
-can restore the endpoint without repeating the redirect flow.
-
-Before using a persisted endpoint, the client ****MUST**** validate it by sending
-`GET {endpoint}/info` and confirming that the response identifies a valid
-[[ref:DWN Server]]. If validation fails, the client ****SHOULD**** remove the
-stale endpoint from storage and fall back to other discovery channels.
-
-### Local Authentication {#local-authentication}
-
-When a [[ref:DWN Client]] and [[ref:DWN Server]] communicate over the public
-network, TLS provides channel authentication and the DWN message's JWS
-authorization identifies the author. On a local transport, the channel itself
-may lack authentication — for example, any process on the device can connect to
-a localhost TCP port.
-
-Local transports ****SHOULD**** implement transport-level authentication to
-establish the identity of the connecting client before accepting DWN messages.
-This is **in addition to**, not a replacement for, the DWN message-level
-authorization defined in the [DWN specification](https://github.com/enboxorg/dwn-spec).
-
-#### Challenge-Response Authentication {#local-challenge-response}
-
-For transports where the operating system does not provide caller identity
-(e.g., localhost TCP on iOS), the following challenge-response flow is
-****RECOMMENDED****:
-
-1. The client connects to the server.
-2. The server generates a cryptographically random nonce (****RECOMMENDED**** 32
-   bytes, hex-encoded) and sends it to the client.
-3. The client signs the nonce using a DID key and returns the signature as a
-   compact JWS (RFC 7515) with the `kid` header set to the DID key ID.
-4. The server resolves the client's DID, verifies the JWS signature, and
-   determines whether the client is authorized.
-5. On success, the server issues an opaque session token. The client includes
-   this token in subsequent requests via an `Authorization: Bearer {token}`
-   header (for HTTP) or as a `sessionToken` field in the JSON-RPC params
-   (for non-HTTP transports).
-
-Session tokens ****MUST**** be time-limited. Servers ****SHOULD**** expire tokens
-after a ****RECOMMENDED**** maximum of 1 hour. Clients ****MUST**** re-authenticate
-when a token expires.
-
-#### Platform-Native Caller Verification {#platform-caller-verification}
-
-On platforms that provide OS-level caller identity, servers ****MAY**** use the
-platform mechanism instead of or in addition to the challenge-response flow:
-
-- **Android:** `Binder.getCallingUid()` identifies the calling app's UID. The
-  server can resolve this to a package name and signing certificate via
-  `PackageManager`, providing cryptographically strong caller identity without
-  any application-level handshake.
-
-- **iOS (same developer):** When the client and server share an App Group (same
-  developer team), shared Keychain items or App Group containers can be used to
-  exchange authentication tokens out of band.
-
-### iOS Local Transport {#ios-local-transport}
-
-#### Mechanism {#ios-mechanism}
-
-On iOS, cross-developer inter-process communication is limited to the loopback
-network interface. The iOS [[ref:Local Transport]] reuses the
-[HTTP transport](#http-transport) and [WebSocket transport](#websocket-transport)
-defined in this specification, with the server bound to `127.0.0.1` instead of
-a public network interface.
-
-All rules defined in the HTTP and WebSocket transport sections apply unchanged,
-with the following exceptions:
-
-- **TLS is not required.** Plaintext `http://` and `ws://` connections are
-  permitted on the loopback interface (`127.0.0.1`). See
-  [TLS Requirements](#tls-requirements).
-- **CORS:** The server ****MUST**** accept requests from browser extension
-  origins (e.g., `safari-web-extension://` scheme). See
-  [Browser Extension Transport](#browser-extension-transport).
-
-#### Discovery {#ios-discovery}
-
-iOS does not provide a shared filesystem between apps from different developers.
-The [[ref:Discovery File]] mechanism is not available on iOS for cross-developer
-scenarios.
-
-Clients ****SHOULD**** use [Well-Known Port Probing](#well-known-port-probing)
-as the primary discovery mechanism. Clients ****MAY**** additionally use
-[Bonjour / mDNS Discovery](#bonjour-discovery).
-
-Clients ****MAY**** use `UIApplication.canOpenURL()` with the `dwn://` scheme
-(if registered by the server app) to determine whether a DWN app is installed,
-but this does not indicate whether the server is currently listening.
-
-#### Activation {#ios-activation}
-
-A local [[ref:DWN Server]] app on iOS may be suspended by the operating system
-when it is not in the foreground. Clients ****MAY**** activate a suspended server
-using a registered URL scheme:
-
-1. The client opens a URL of the form `dwn://activate`.
-2. The operating system foregrounds the server app, which starts its
-   localhost listener.
-3. The server app ****MAY**** call back to the client via the client's registered
-   URL scheme to signal readiness.
-4. The client connects to the server's localhost endpoint.
-
-::: note
-URL scheme activation causes a visible app switch. Both the client and server
-apps can use `beginBackgroundTask` to obtain approximately 30 seconds of
-background execution time for completing the IPC transaction.
-:::
-
-#### Background Constraints {#ios-background}
-
-iOS suspends app processes within seconds of entering the background. A local
-[[ref:DWN Server]] on iOS is **not** a persistent server. Clients ****MUST****
-be prepared for the server to become unreachable at any time and ****SHOULD****
-implement retry with re-activation when a connection fails.
-
-Implementations ****MUST NOT**** rely on background execution entitlements
-(audio, location, VoIP) solely for the purpose of maintaining a DWN server
-listener. Such usage violates Apple's App Store guidelines.
-
-### Android Local Transport {#android-local-transport}
-
-#### Mechanism {#android-mechanism}
-
-On Android, the [[ref:Local Transport]] uses an
-[AIDL (Android Interface Definition Language)](https://developer.android.com/guide/components/aidl)
-Bound Service. This is the platform-native inter-process communication
-mechanism and provides:
-
-- Automatic service lifecycle management (the server process is started on
-  demand via `BIND_AUTO_CREATE`).
-- OS-enforced caller identity via `Binder.getCallingUid()`.
-- Bidirectional communication with callback interfaces for subscriptions.
-- Streaming binary data via `ParcelFileDescriptor` pipes.
-
-#### AIDL Interface {#android-aidl-interface}
-
-A local [[ref:DWN Server]] on Android ****MUST**** expose a Bound Service
-implementing the following AIDL interface:
-
-```java
-// IDwnService.aidl
-package org.enbox.dwn;
-
-import org.enbox.dwn.IDwnCallback;
-
-interface IDwnService {
-    /**
-     * Process a DWN JSON-RPC message without binary data.
-     *
-     * @param jsonRpcRequest JSON-serialized JsonRpcRequest
-     * @return JSON-serialized JsonRpcResponse
-     */
-    String processMessage(String jsonRpcRequest);
-
-    /**
-     * Process a DWN JSON-RPC message with an associated binary data stream.
-     * Used for RecordsWrite (client sends data) and RecordsRead (server
-     * returns data).
-     *
-     * @param jsonRpcRequest JSON-serialized JsonRpcRequest
-     * @param dataIn ParcelFileDescriptor for the client-to-server data
-     *               stream, or null for read operations
-     * @return Bundle containing:
-     *         - "jsonrpc_response" (String): JSON-serialized JsonRpcResponse
-     *         - "data_out" (ParcelFileDescriptor): server-to-client data
-     *           stream, or null if the response has no data
-     */
-    Bundle processMessageWithData(String jsonRpcRequest,
-                                  in ParcelFileDescriptor dataIn);
-
-    /**
-     * Open a subscription.
-     *
-     * @param jsonRpcRequest JSON-serialized JsonRpcRequest with method
-     *                       "rpc.subscribe.dwn.processMessage"
-     * @param callback Callback interface for receiving subscription events
-     * @return JSON-serialized JsonRpcResponse (the subscribe acknowledgment)
-     */
-    String subscribe(String jsonRpcRequest, IDwnCallback callback);
-
-    /**
-     * Close an active subscription.
-     *
-     * @param subscriptionId The subscription ID to close
-     */
-    void unsubscribe(String subscriptionId);
-
-    /**
-     * Retrieve server information.
-     *
-     * @return JSON-serialized ServerInfo object
-     */
-    String getServerInfo();
-}
-```
-
-```java
-// IDwnCallback.aidl
-package org.enbox.dwn;
-
-oneway interface IDwnCallback {
-    /**
-     * Deliver a subscription event.
-     *
-     * @param subscriptionId The subscription this event belongs to
-     * @param jsonRpcEvent JSON-serialized JsonRpcResponse containing
-     *                     a SubscriptionMessage in result.subscription
-     */
-    void onEvent(String subscriptionId, String jsonRpcEvent);
-
-    /**
-     * Signal that the server has closed the subscription.
-     *
-     * @param subscriptionId The closed subscription ID
-     * @param reason Human-readable reason for closure
-     */
-    void onClose(String subscriptionId, String reason);
-}
-```
-
-The `IDwnCallback` interface is declared `oneway` (asynchronous) so that the
-server does not block waiting for the client to process each event.
-
-#### JSON-RPC Mapping {#android-json-rpc-mapping}
-
-The AIDL interface passes [[ref:JSON-RPC Envelope]] messages as `String`
-parameters. The JSON-RPC request and response objects are identical to those
-defined in the [JSON-RPC 2.0 Wire Format](#json-rpc-wire-format) section. The
-AIDL layer is a transport for these envelopes, not a replacement for them.
-
-For messages without binary data (`RecordsQuery`, `RecordsDelete`,
-`ProtocolsConfigure`, etc.), clients call `processMessage()` and receive the
-JSON-RPC response as a return value.
-
-For messages with binary data:
-
-- **RecordsWrite (client sends data):** The client creates a
-  `ParcelFileDescriptor` pipe, writes the record data to the write end, and
-  passes the read end to `processMessageWithData()`. The JSON-RPC request in
-  the `jsonRpcRequest` parameter is identical to the `dwn-request` header
-  content in the HTTP transport.
-
-- **RecordsRead (server returns data):** The server creates a pipe, writes
-  the record data to the write end, and returns the read end in the
-  `data_out` field of the result `Bundle`. The JSON-RPC response in the
-  `jsonrpc_response` field is identical to the `dwn-response` header content
-  in the HTTP transport.
-
-#### Service Declaration {#android-service-declaration}
-
-The DWN server app ****MUST**** declare the service in its `AndroidManifest.xml`:
-
-```xml
-<service
-    android:name=".DwnNodeService"
-    android:exported="true"
-    android:permission="org.enbox.dwn.permission.ACCESS_DWN">
-    <intent-filter>
-        <action android:name="org.enbox.dwn.BIND_DWN_SERVICE" />
-    </intent-filter>
-</service>
-```
-
-The server app ****SHOULD**** declare a custom permission for access control:
-
-```xml
-<permission
-    android:name="org.enbox.dwn.permission.ACCESS_DWN"
-    android:label="Access DWN Node"
-    android:description="Allows an application to communicate with the
-                         local Decentralized Web Node"
-    android:protectionLevel="dangerous" />
-```
-
-A `protectionLevel` of `"dangerous"` requires runtime user consent before a
-client app can bind to the service. The server app ****MAY**** additionally
-verify the calling app's signing certificate via
-`PackageManager.getPackageInfo()` and `SigningInfo` to enforce an allowlist
-of authorized clients.
-
-#### Service Binding {#android-service-binding}
-
-Clients bind to the DWN service using an explicit intent:
-
-```java
-Intent intent = new Intent("org.enbox.dwn.BIND_DWN_SERVICE");
-intent.setPackage("org.enbox.dwn.server"); // target package
-
-context.bindService(intent, serviceConnection,
-    Context.BIND_AUTO_CREATE);
-```
-
-When `BIND_AUTO_CREATE` is specified, the operating system starts the server
-app's process if it is not already running. The client receives the `IBinder`
-in its `ServiceConnection.onServiceConnected()` callback.
-
-If the server process is killed by the system, the client receives
-`onServiceDisconnected()`. Clients ****SHOULD**** implement reconnection with
-exponential backoff.
-
-#### Subscription Delivery {#android-subscription-delivery}
-
-The server delivers subscription events by invoking methods on the
-`IDwnCallback` interface provided by the client during `subscribe()`. The
-server ****SHOULD**** use `RemoteCallbackList` to manage callbacks, which
-automatically unregisters callbacks when the client process dies.
-
-The JSON-RPC event messages delivered via `onEvent()` are identical in format
-to the subscription events defined in
-[Subscription Events](#ws-subscription-events). The same `type` discriminator
-(`"event"` or `"eose"`) and cursor semantics apply.
-
-Flow control follows the same principles as
-[WebSocket Flow Control](#ws-flow-control): the server ****SHOULD**** limit the
-number of unacknowledged events per subscription. The client acknowledges events
-by calling `processMessage()` with an `rpc.ack` JSON-RPC notification.
-
-### Browser Extension Transport {#browser-extension-transport}
-
-#### Overview {#extension-overview}
-
-An [[ref:Extension Bridge]] enables web applications running in a browser to
-communicate with a native [[ref:DWN Server]] process on the same device. The
-extension relays [[ref:JSON-RPC Envelope]] messages between the web page's
-JavaScript context and the native DWN, traversing the browser's security
-boundaries via the standard WebExtension messaging APIs.
-
-This transport is particularly relevant on iOS, where a Safari Web Extension
-bundled with a native DWN app allows any web application to use the device's
-native DWN instead of an in-browser implementation backed by IndexedDB.
-
-#### Extension Architecture {#extension-architecture}
-
-The [[ref:Extension Bridge]] consists of the following components:
-
-```
-Web Page JavaScript
-    | window.postMessage() or CustomEvent
-    v
-Content Script (injected into the page)
-    | browser.runtime.sendMessage()
-    v
-Background Service Worker
-    | browser.runtime.sendNativeMessage()
-    v
-Native App Handler (NSExtensionRequestHandling on iOS)
-    | In-process call
-    v
-DWN Node (native process, shared App Group storage)
-```
-
-Each component runs in a separate execution context:
-
-| Component | Process | Lifecycle |
-|-----------|---------|-----------|
-| Web page JavaScript | Safari Web Content process | Page lifetime |
-| Content script | Safari Web Content process (isolated world) | Page lifetime |
-| Background service worker | Extension process | Terminated after ~30s idle (MV3) |
-| Native app handler | App extension process | Request lifetime |
-| DWN node | App extension process or containing app | Varies by implementation |
-
-#### Discovery {#extension-discovery}
-
-The content script ****MUST**** signal its availability to the web page by
-setting a property on the `document` element:
-
-```javascript
-document.documentElement.setAttribute('data-dwn-extension', 'true');
-```
-
-Web applications ****MAY**** check for this attribute to determine whether an
-[[ref:Extension Bridge]] is available. Applications that detect the extension
-****MAY**** use it as the DWN transport instead of constructing an in-browser
-DWN instance.
-
-The content script ****MAY**** additionally dispatch a `CustomEvent` on the
-`document` to notify applications that load before the content script is
-injected:
-
-```javascript
-document.dispatchEvent(new CustomEvent('dwn-extension-available', {
-  detail: { version: '1.0' }
-}));
-```
-
-#### Message Format {#extension-message-format}
-
-Messages exchanged between the web page and the content script ****MUST**** use
-the following envelope:
-
-```json
-{
-  "type": "dwn-request",
-  "id": "unique-request-id",
-  "payload": {
-    "jsonrpc": "2.0",
-    "id": "rpc-id",
-    "method": "dwn.processMessage",
-    "params": {
-      "target": "did:example:alice",
-      "message": { }
-    }
-  },
-  "data": "<base64-encoded binary data, if any>"
-}
-```
-
-The `payload` field contains the standard [[ref:JSON-RPC Envelope]] as defined
-in the [JSON-RPC 2.0 Wire Format](#json-rpc-wire-format) section.
-
-Binary data (for `RecordsWrite` payloads) ****MUST**** be base64-encoded in the
-`data` field. The content script, background service worker, and native handler
-relay this field without modification. The native handler decodes the base64
-data and provides it to the DWN as a data stream.
-
-Response messages use the same envelope with `"type": "dwn-response"`:
-
-```json
-{
-  "type": "dwn-response",
-  "id": "unique-request-id",
-  "payload": {
-    "jsonrpc": "2.0",
-    "id": "rpc-id",
-    "result": {
-      "reply": {
-        "status": { "code": 200, "detail": "OK" }
-      }
-    }
-  },
-  "data": "<base64-encoded response data, if any>"
-}
-```
-
-#### Page-to-Content-Script Communication {#extension-page-content}
-
-The web page sends requests to the content script using `window.postMessage()`:
-
-```javascript
-window.postMessage({
-  type: 'dwn-request',
-  id: requestId,
-  payload: jsonRpcRequest,
-  data: base64Data
-}, window.location.origin);
-```
-
-The content script listens on the `message` event and filters by `type`. The
-content script ****MUST**** verify that `event.origin` matches the page's origin
-and that `event.source === window` to prevent cross-frame message injection.
-
-The content script sends responses back via the same mechanism:
-
-```javascript
-window.postMessage({
-  type: 'dwn-response',
-  id: requestId,
-  payload: jsonRpcResponse,
-  data: base64Data
-}, window.location.origin);
-```
-
-#### Subscription Support {#extension-subscriptions}
-
-For subscriptions (`RecordsSubscribe`, `MessagesSubscribe`), the extension
-****MUST**** use `browser.runtime.connectNative()` to establish a persistent
-port to the native handler. The native handler maintains the DWN subscription
-and pushes events through the port.
-
-The event delivery chain for subscriptions is:
-
-```
-DWN Node (subscription event)
-    | Native handler pushes event via persistent port
-    v
-Background Service Worker
-    | browser.tabs.sendMessage(tabId, event)
-    v
-Content Script
-    | window.postMessage(event)
-    v
-Web Page JavaScript (subscription handler invoked)
-```
-
-Subscription event messages use `"type": "dwn-subscription-event"` and contain
-the same [[ref:SubscriptionMessage]] format defined in
-[Subscription Events](#ws-subscription-events):
-
-```json
-{
-  "type": "dwn-subscription-event",
-  "subscriptionId": "sub-1",
-  "payload": {
-    "type": "event",
-    "cursor": "...",
-    "event": {
-      "message": { },
-      "initialWrite": { }
-    }
-  }
-}
-```
-
-Because the background service worker may be terminated after ~30 seconds of
-inactivity (Manifest V3), the extension ****SHOULD**** use `browser.alarms`
-to periodically wake the service worker and re-establish the `connectNative()`
-port if it was dropped. Clients ****SHOULD**** persist the last received cursor
-and resume subscriptions from that point after reconnection.
-
-#### Large Data Transfer {#extension-large-data}
-
-Extension messaging channels have practical size limits (typically a few
-megabytes). For `RecordsWrite` operations with data payloads that exceed
-the messaging limit, implementations ****MAY**** use an alternative data
-transfer mechanism:
-
-1. The native handler starts a temporary localhost HTTP listener.
-2. The extension returns a `data_url` field in the response pointing to
-   `http://127.0.0.1:{port}/{path}`.
-3. The web page fetches the data directly from the localhost URL.
-
-This hybrid approach uses extension messaging for the JSON-RPC control plane
-and localhost HTTP for the data plane. The temporary listener ****SHOULD**** be
-shut down after the transfer completes or after a timeout.
-
-#### Safari Web Extension Specifics {#safari-extension-specifics}
-
-On iOS, Safari Web Extensions are bundled within a containing iOS app. The
-extension and containing app share an App Group container, enabling:
-
-- Shared persistent storage (the DWN's database files).
-- Shared Keychain items (cryptographic keys).
-- Shared `UserDefaults` (configuration, discovery state).
-
-The native app handler (`NSExtensionRequestHandling`) runs in the app extension
-process, which is separate from the containing app's process. However, both
-processes can access the shared App Group container simultaneously.
-
-The extension's `manifest.json` ****MUST**** declare the following permissions
-for localhost communication (used by the [large data transfer](#extension-large-data)
-fallback and [direct fetch](#extension-direct-fetch) paths):
-
-```json
-{
-  "host_permissions": ["http://127.0.0.1/*"],
-  "content_security_policy": {
-    "extension_pages": "script-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:*"
-  }
-}
-```
-
-#### Direct Fetch Path {#extension-direct-fetch}
-
-As an optimization, the background service worker ****MAY**** communicate
-directly with a localhost [[ref:DWN Server]] via `fetch()` or `WebSocket`,
-bypassing the native messaging chain entirely. This is viable when:
-
-- The DWN server is running and listening on localhost (discovered via
-  [Well-Known Port Probing](#well-known-port-probing)).
-- The extension has `host_permissions` for `http://127.0.0.1/*`.
-
-In this mode, the extension functions as a thin proxy: the content script
-relays messages to the background service worker, which makes HTTP requests
-or opens WebSocket connections to `http://127.0.0.1:{port}` using the
-standard [HTTP transport](#http-transport) or
-[WebSocket transport](#websocket-transport).
-
-This path provides better performance (fewer hops) and supports all DWN
-operations including binary data transfer and subscriptions, but requires the
-DWN server to be actively listening on localhost.
-
-### Local Transport Security Considerations {#local-transport-security}
-
-#### Port Binding Races {#port-binding-races}
-
-On platforms where the DWN server listens on a localhost TCP port (iOS, desktop),
-a malicious local application could bind to the same port before the DWN server
-starts, intercepting client connections. Mitigations include:
-
-- Clients ****SHOULD**** verify the server's identity via the
-  [ServerInfo](#server-info-object) response before sending DWN messages.
-- Clients ****SHOULD**** use [Local Authentication](#local-authentication) to
-  establish mutual trust.
-- Server implementations ****SHOULD**** bind to a random available port and
-  advertise it via the [[ref:Discovery File]] or Bonjour, rather than relying
-  solely on well-known ports.
-
-#### Extension Origin Verification {#extension-origin-verification}
-
-Content scripts ****MUST**** verify the `origin` of `window.postMessage` events
-to prevent malicious iframes or cross-origin scripts from injecting DWN
-requests. Content scripts ****SHOULD**** only process messages where
-`event.source === window` and `event.origin` matches the top-level page origin.
-
-#### Session Token Security {#session-token-security}
-
-Session tokens issued by the [Local Authentication](#local-authentication) flow
-****MUST**** be cryptographically random, at least 256 bits in length, and
-transmitted only over the local transport channel. Tokens ****MUST NOT**** be
-stored in locations accessible to other applications.
-
-#### Multi-User Device Concerns {#multi-user-devices}
-
-On devices with multiple user accounts (Android multi-user, macOS fast user
-switching), the loopback interface is shared across all users. DWN server
-implementations ****MUST**** authenticate connecting clients and ****MUST NOT****
-assume that all localhost connections originate from the same user.
-
+|---|---|---|---|
+| `endpoint` | `string` | Yes | Loopback URL where the local server is listening (non-empty string in `isValidRecord`) |
+| `pid` | `number` | Yes | OS process ID of the local server (required by `isValidRecord`; stale or corrupt files are deleted on read) |
+| `capabilities` | `string[]` | No | Advertised transport capabilities (e.g., `["http", "ws"]`) |
+| `localNodeToken` | `string` | No | Origin-less bearer token for CLI/native callers |
+
+#### Passive Startup Discovery and User-Gesture Probing {#passive-discovery}
+
+- **CLI / native**: `LocalDwnDiscovery` reads `~/.enbox/dwn.json` and verifies
+  `GET /info` reports `server === "@enbox/dwn-server"` (only `@enbox/local-node`
+  single-instance detection and browser discovery additionally require
+  `localNode === true`).
+- **Browser startup**: Strictly **passive** — never sweeps localhost ports
+  automatically (avoiding browser Private Network Access permission prompts).
+  Revalidates persisted pairings via `GET /info` (`localNode === true`) +
+  `GET /local/status`.
+- **Explicit user-gesture probing (`probeLocalDwn`)**: First validates any
+  persisted pairing; otherwise checks environment support (returning
+  `{ status: "unsupported", reason }` for insecure contexts, Safari, or
+  `"no-fetch"` when `fetch` is unavailable) and probes `127.0.0.1` ports
+  `55500..55509, 3000` only on explicit user action.
+- **Desktop scheme (`dwn://connect`)**: Desktop launchers (such as
+  `electrobun-dwn`, which runs `DwnServer` without enabling the Local Node
+  Profile or writing `localNodeToken`) handle
+  `dwn://connect?callback=<encoded-url>` by redirecting to
+  `<callback>#<base64url({"endpoint":"http://127.0.0.1:..."})>`, validated by
+  `dwn-discovery-payload.ts` to loopback hostnames (`127.0.0.1`, `::1`,
+  `localhost`, or `*.localhost`).
 
 ## Security Considerations {#security-considerations}
 
 ### TLS Requirements {#tls-requirements}
 
-All HTTP and WebSocket connections to remote [[ref:DWN Servers]] ****MUST**** use TLS.
-[[ref:Service Endpoint]] URLs ****MUST**** use the `https` scheme.
-WebSocket connections to remote servers ****MUST**** use `wss`.
+Remote [[ref:DWN Servers]] ****SHOULD**** be deployed behind TLS (`https://` and
+`wss://`). Loopback [[ref:Local Transport]] endpoints (`127.0.0.1`, `::1`,
+`localhost`) ****MAY**** use plaintext `http://` and `ws://`.
 
-Plaintext `http` and `ws` connections ****MUST NOT**** be used for remote
-communication in production. Implementations ****MAY**** permit plaintext
-connections for local development only.
+### Rate Limiting and Tenant Quotas {#rate-limiting}
 
-**Exception for Local Transports:** [[ref:Local Transport]] connections to the
-loopback interface (`127.0.0.1`) ****MAY**** use plaintext `http` and `ws`.
-Traffic on the loopback interface does not traverse any network and is not
-subject to the same interception risks as remote connections. See
-[iOS Local Transport](#ios-local-transport) and
-[Browser Extension Transport](#browser-extension-transport).
+`dwn-server` enforces token-bucket rate limits at three levels:
+1. **Per-IP HTTP**: default `30 req/s`, burst `50` → HTTP `429`, `Retry-After`,
+   `{"error":"Rate limit exceeded"}` (WebSocket upgrades bypass per-IP HTTP rate
+   limiting).
+2. **Per-tenant DID (HTTP & WebSocket)**: default `20 req/s`, burst `50` →
+   JSON-RPC `-50429` (`TooManyRequests`, `data: { retryAfterSec }`), plus HTTP
+   `429` + `Retry-After` on HTTP.
+3. **Per-origin local pairing (`POST /local/pair`)**: `5` requests per `60s` →
+   HTTP `429` + `Retry-After`.
 
-### Rate Limiting {#rate-limiting}
-
-Servers ****SHOULD**** implement rate limiting to prevent abuse. Rate limits ****MAY****
-vary by tenant, by source IP, or by operation type.
-
-Servers ****SHOULD**** return HTTP `429 Too Many Requests` when a rate limit is exceeded.
+Per-tenant message-count and storage quotas (active when `adminStore` is
+configured via `adminToken`) return JSON-RPC `-32600` (`InvalidRequest`) with
+structured `data: { code: "TenantMessageQuotaExceeded" | "TenantStorageQuotaExceeded" }`.
 
 ### Message Size Limits {#message-size-limits}
 
-The server's maximum file size is advertised in the [ServerInfo](#server-info-object)
-`maxFileSize` field. Clients ****MUST NOT**** send `RecordsWrite` data exceeding
-this limit. Servers ****SHOULD**** reject oversized payloads with HTTP `413 Payload
-Too Large`.
+- **HTTP RPC JSON envelope**: strictly capped at **1 MiB**
+  (`HTTP_DWN_RPC_MAX_ENVELOPE_BYTES = 1_048_576`) by `http-dwn-rpc-framing.ts`.
+- **Record data (`maxFileSize` / `maxRecordDataSize`)**: default **100 MiB**
+  (`104_857_600`) on `dwn-server` (`1 GiB` on `local-node`), advertised in
+  `GET /info` and enforced on WebSocket `maxPayloadLength` and
+  `dwn.applyReplicatedMessage` inline `params.encodedData` (`-32602`). Note that
+  current `dwn-server` does not explicitly enforce `maxRecordDataSize` on HTTP
+  `POST /` record streams (relying on the HTTP runtime body limit), and inbound
+  HTTP stream capping to `descriptor.dataSize` is applied only in
+  `dwn.applyReplicatedMessage` (not `dwn.processMessage`).
 
-The `dwn-request` header value ****SHOULD NOT**** exceed 8 KB. Implementations
-****MAY**** reject requests with excessively large headers.
+### WebSocket, Header, and Input Hardening {#websocket-security}
 
-### WebSocket Security {#websocket-security}
-
-- Servers ****SHOULD**** limit the number of concurrent WebSocket connections per
-  source IP to prevent resource exhaustion.
-- Servers ****SHOULD**** limit the number of active subscriptions per connection.
-- Servers ****MUST**** close WebSocket connections that fail heartbeat checks.
-- Servers ****SHOULD**** set a maximum WebSocket message frame size and reject
-  oversized frames.
-- Servers ****MUST**** enforce the [flow control](#ws-flow-control) buffer limit
-  to prevent unbounded memory growth from unacknowledged subscriptions.
-
-### Header Injection {#header-injection}
-
-The `dwn-request`, `dwn-response`, and `dwn-payment` headers carry JSON payloads.
-Implementations ****MUST**** validate that these values are well-formed JSON before
-processing. Implementations ****MUST NOT**** reflect unsanitized header values in
-responses.
-
-### Payment Security {#payment-security}
-
-- Servers ****MUST**** expire `paymentId` values after a bounded timeout to prevent
-  replay attacks using stale payment challenges.
-- Servers ****MUST**** ensure each `paymentId` is used at most once.
-- Servers ****MUST**** verify payment proofs before processing the DWN message.
-  A server ****MUST NOT**** process a message and then fail payment verification.
-- For the L402 scheme, servers ****MUST**** use cryptographically strong root keys
-  for macaroon signing and ****SHOULD**** rotate root keys periodically.
-- For the Cashu scheme, servers ****MUST**** verify proof state (unspent) with the
-  mint before processing the message, to prevent double-spend of ecash proofs.
-- For the x402 scheme, servers ****SHOULD**** verify the payment signature before
-  processing the message, either locally or via the facilitator's `/verify` endpoint.
-- The `dwn-payment` header ****SHOULD NOT**** exceed 8 KB. Implementations ****MAY****
-  reject requests with excessively large payment headers.
+- Servers enforce RFC 6455 `ping` timeouts (30s), `maxPayloadLength`, and
+  per-subscription flow-control bounds (`maxInFlight: 32`, `MAX_BUFFER_SIZE: 1000`,
+  `MAX_BUFFER_WAIT_MS: 30s`).
+- `dwn-response` headers carry JSON envelopes and ****MUST**** be parsed safely
+  by clients; REST query parsers silently ignore prototype-pollution keys
+  (`__proto__`, `constructor`, `prototype`).
+- Internal server errors are redacted to generic messages on the wire, and
+  WebSocket clients strip query strings/credentials (`?localNodeToken=...`) from
+  error logs.
+- Local-node servers enforce loopback bind, `Host` header validation (`403`),
+  constant-time token comparison, origin binding, `0o600` credential file
+  permissions (POSIX), single-use pairing token delivery, and immediate
+  WebSocket closure upon token revocation.
 
 ### Transport-Layer Privacy {#transport-privacy}
 
 ::: note
-DWN messages carried over HTTPS or WebSocket are protected by TLS, which encrypts
-the wire content from network observers. However, TLS alone does not conceal all
-metadata. The target DWN's service endpoint URL is visible in DNS lookups and TLS
-SNI, the sender's IP address is visible to the server, and request timing and
-sizes are observable by network intermediaries. When record-level encryption is
-used (as defined in the [DWN specification](https://github.com/enboxorg/dwn-spec)),
-the record data is additionally protected at rest — but the transport metadata
-remains exposed.
-
-For deployments that require stronger transport-layer privacy, implementations
-****MAY**** wrap DWN JSON-RPC payloads inside a [DIDComm v2](https://identity.foundation/didcomm-messaging/spec/v2.1/)
-encrypted message envelope before transmission. DIDComm's routing protocol
-enables onion-style multi-hop delivery through mediators, where each intermediary
-sees only the next hop and an opaque encrypted payload — no single party along
-the route learns both the original sender and the final recipient. The DIDComm
-envelope is stripped upon delivery to the target DWN server, and the inner DWN
-message is then processed through the standard authorization and handling pipeline.
-
-This layering is strictly additive: the DIDComm envelope provides ephemeral,
-transit-scoped privacy (protecting the journey), while DWN's own authorization
-model, CID-based signatures, and record-level encryption provide persistent,
-data-scoped security (protecting the destination). The two layers serve
-fundamentally different purposes and ****MUST NOT**** be conflated:
-
-- **DIDComm envelopes are disposable.** They use per-message ECDH key agreement
-  (ECDH-1PU for authenticated encryption, or ECDH-ES for anonymous encryption)
-  to protect a single message in transit. Once delivered, the envelope is
-  discarded. DIDComm signatures (when used) wrap the full message body, making
-  them unsuitable for content-addressed storage where data and metadata are
-  stored and verified independently.
-
-- **DWN authorization is persistent.** DWN messages sign a CID of the descriptor
-  — a content-addressed commitment that remains verifiable regardless of how the
-  message was transported or re-serialized. DWN's multi-layered authorization
-  (owner, delegate, permission grant, protocol rules) and hierarchical key
-  derivation for encryption are designed for long-lived data, not ephemeral
-  communication.
-
-Implementations that adopt DIDComm as a transport envelope ****MUST**** ensure that
-DWN message authentication and authorization are performed on the unwrapped DWN
-message, not on any properties of the DIDComm envelope. The DIDComm layer
-provides no authorization guarantees that are meaningful to the DWN processing
-pipeline.
+TLS protects wire payloads in transit, but endpoint URLs (DNS/SNI), client IP
+addresses, and request timing/sizes remain observable at the transport layer.
+Record-level encryption (defined in the DWN specification) protects data at rest
+and in transit independently of transport encryption. Deployments requiring
+stronger transit anonymity may wrap DWN JSON-RPC messages in onion-routed or
+relay-mediated transport layers while preserving end-to-end DWN message
+authorization and CID verification at the destination node.
 :::
 
 ## Normative References
 
-[[spec]]
-~ [DWN Specification](https://github.com/enboxorg/dwn-spec). Enbox.
+[DWN Specification](https://github.com/enboxorg/dwn-spec)
+~ Enbox Decentralized Web Node Specification.
+
+[Enbox Connect Protocol Specification](https://github.com/enboxorg/web5-connect-spec)
+~ Enbox Connect Protocol (v2) Specification.
+
+[JSON-RPC 2.0 Specification](https://www.jsonrpc.org/specification)
+~ JSON-RPC Working Group. March 2010.
+
+[[spec:RFC4648]]
+~ [The Base16, Base32, and Base64 Data Encodings](https://datatracker.ietf.org/doc/html/rfc4648). S. Josefsson. October 2006.
 
 [[spec:RFC6455]]
 ~ [The WebSocket Protocol](https://datatracker.ietf.org/doc/html/rfc6455). I. Fette, A. Melnikov. December 2011.
-
-[[spec:RFC7049]]
-~ [Concise Binary Object Representation (CBOR)](https://datatracker.ietf.org/doc/html/rfc7049). C. Bormann, P. Hoffman. October 2013.
 
 [[spec:RFC8259]]
 ~ [The JavaScript Object Notation (JSON) Data Interchange Format](https://datatracker.ietf.org/doc/html/rfc8259). T. Bray. December 2017.
@@ -2932,5 +1391,5 @@ pipeline.
 [[spec:RFC2119]]
 ~ [Key words for use in RFCs to Indicate Requirement Levels](https://datatracker.ietf.org/doc/html/rfc2119). S. Bradner. March 1997.
 
-[[spec:RFC9110]]
-~ [HTTP Semantics](https://datatracker.ietf.org/doc/html/rfc9110). R. Fielding, M. Nottingham, J. Reschke. June 2022.
+[RFC 9110 — HTTP Semantics](https://datatracker.ietf.org/doc/html/rfc9110)
+~ R. Fielding, M. Nottingham, J. Reschke. June 2022.
