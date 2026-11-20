@@ -170,9 +170,10 @@ and `dwn`. Resolving a DID for its endpoints has one of four outcomes:
 When a DID lists several endpoints, each is a server holding the same DID's
 data.
 
-- A client ****SHOULD**** try another endpoint when a request to one fails,
-  including when a read answers that the server does not hold a record's data
-  (status `410`).
+- A client ****SHOULD**** try another endpoint when a transport or RPC request
+  to one fails; when a `RecordsRead` answers that the server does not hold a
+  record's data (DWN status `410`, returning `entry.recordsWrite`), a caller
+  that needs the data ****SHOULD**** retry the read against another endpoint.
 - A sync client keeps each endpoint in agreement with its own node separately,
   as the [DWN Sync Protocol](https://dwn-sync-spec.pages.dev) defines.
 
@@ -271,9 +272,9 @@ verdict is the `status` inside `result.reply`. A reply with status `401`,
 
 | Code | Name | Sent when |
 |---|---|---|
-| `-32600` | `InvalidRequest` | A subscription is attempted over HTTP, or without a `subscription` object; or the tenant is over its quota (see below) |
+| `-32600` | `InvalidRequest` | A subscription method is attempted over HTTP; `subscription` is missing on `rpc.subscribe.dwn.processMessage` or `rpc.subscribe.close`; or the tenant is over its quota (see below) |
 | `-32601` | `MethodNotFound` | The method is unknown |
-| `-32602` | `InvalidParams` | The parameters are missing or invalid; a subscription ID is already in use, or is unknown on `rpc.subscribe.close`; or the request is not allowed on this transport |
+| `-32602` | `InvalidParams` | The parameters are missing or invalid (including a missing `subscription` or invalid `cursor` on `rpc.ack`); a subscription ID is already in use, or is unknown on `rpc.subscribe.close`; or the request is not allowed on this transport |
 | `-32603` | `InternalError` | The server failed unexpectedly |
 | `-50400` | `BadRequest` | The HTTP framing is malformed, or a WebSocket frame is empty or not valid JSON |
 | `-50403` | `Forbidden` | The caller may not use an option reserved for local callers |
@@ -388,7 +389,7 @@ Closes a subscription.
 
 - **Parameters:** none.
 - **`subscription`:** `{ "id": "<subscription ID>" }`. A missing `subscription` is answered with `-32600`, and an unknown ID with `-32602`.
-- **Result:** `{ "reply": { "status": 200, "detail": "Accepted" } }`.
+- **Result:** `{ "reply": { "status": 200, "detail": "Accepted" } }` (note that `status` here is the number `200`, not a `{ code, detail }` object).
 
 #### `rpc.ack`
 
@@ -397,7 +398,7 @@ Acknowledges messages received on a subscription. See
 
 - **Parameters:** `{ "cursor": <progress token> }`, the `cursor` of the last message being acknowledged.
 - **`subscription`:** `{ "id": "<subscription ID>" }`. A missing `subscription` or an invalid `cursor` is answered with `-32602`.
-- **Result:** `{ "reply": { "status": 200, "detail": "OK" } }`. If the request had no `id`, the server answers with one of its own.
+- **Result:** `{ "reply": { "status": 200, "detail": "OK" } }` (`status` is the number `200`). If the request had no `id`, the server answers with one of its own.
 
 #### `rpc.ping`
 
@@ -409,9 +410,9 @@ Checks that the connection and the server are alive.
 ## HTTP Transport
 
 A client sends a JSON-RPC request as an HTTP `POST` to the
-[[ref:Service Endpoint]] URL. The body holds the request and, when there is
-any, the record's data, so that data of any size can be streamed without
-being encoded into JSON.
+[[ref:Service Endpoint]] URL. The body holds the request and, when a record
+data stream is supplied, the raw bytes of that data, so that data of any size
+can be streamed without being encoded into JSON.
 
 (`GET` on the same URL returns a short plain-text notice. It is not part of
 the protocol.)
@@ -430,15 +431,23 @@ The body has three parts:
 +--------+---------------------+----------------------------+------------------+
 ```
 
-- **Flags.** `0x00` means the body ends with the envelope. `0x01` means the
-  record's data follows the envelope. Any other value is invalid.
+- **Flags.** `0x00` means **no record data stream accompanies the request** (`dataStream` is absent). `0x01` means **a record data stream follows the envelope**. Any other value is invalid.
 - **Envelope length.** The length of the envelope in bytes, as an unsigned
   32-bit big-endian integer. It ****MUST**** be at least 1 and at most
   1,048,576 (1 MiB).
 - **Envelope.** The JSON-RPC request, as JSON in UTF-8.
-- **Data.** Present only with flags `0x01`: the raw bytes of the record's data,
-  running to the end of the body. Its length is not stated in the frame; it
-  is `descriptor.dataSize` of the message.
+- **Data.** Present when and only when flags is `0x01`: the raw bytes of the
+  record's data, running to the end of the body. Its length is not stated in
+  the frame; it is `descriptor.dataSize` of the message (`0` trailing bytes
+  when `descriptor.dataSize` is `0`).
+
+::: warning Zero-Byte Records (`dataSize: 0`) vs. Dataless Initial Writes
+To write a complete `0`-byte record (`202 Accepted`), a client ****MUST****
+send flags `0x01` followed by `0` bytes of data. Sending an initial
+`RecordsWrite` with flags `0x00` omits the data stream (`dataStream` absent),
+which the node stores as an incomplete ancestry-only skeleton (`204 No
+Content`, `isLatestBaseState: false`) even when `descriptor.dataSize` is `0`.
+:::
 
 With flags `0x00` a client ****MUST NOT**** send anything after the envelope.
 A server stops reading at the end of the envelope, and ****MAY**** reject a
@@ -464,7 +473,7 @@ Content-Type: application/vnd.enbox.dwn-rpc
 `RecordsRead`, or a `MessagesRead` of a record with data):
 
 - the response body is the data, with `Content-Type: application/octet-stream`; and
-- the JSON-RPC response is in the `dwn-response` header, as JSON, without the data.
+- the JSON-RPC response is in the `dwn-response` header, as ASCII-safe JSON (escaping any character `>= U+0080` as `\uXXXX` per [[spec:RFC8259]] so the header value contains only printable ASCII), without the data.
 
 ::: example A `RecordsRead` Response
 ```http
@@ -700,8 +709,9 @@ A server offers a few `GET` routes for data that anyone may read. Each builds
 an unsigned DWN message and returns what the node answers, so they reach only
 published records and published modules.
 
-Where a route would otherwise reveal that something exists but is not public,
-it answers `404`, exactly as if it did not exist.
+Where a read or module route receives status `401` from the node (for example,
+an unpublished record or an inactive tenant), it answers `404` with an empty
+body rather than `401`.
 
 ### Read a Record
 
@@ -712,10 +722,10 @@ GET /:did/read/records/:recordId
 
 | Node's reply | HTTP response |
 |---|---|
-| `200`, with data | `200`. The body is the record's data, with `Content-Type` set to the record's `dataFormat`. The `dwn-response` header holds the `RecordsRead` reply as JSON |
+| `200`, with data | `200`. The body is the record's data, with `Content-Type` set to the record's `dataFormat`. The `dwn-response` header holds the `RecordsRead` reply as ASCII-safe JSON |
 | `200`, without data | `400`, with an empty body |
 | `401` | `404`, with an empty body |
-| Any other status | That status, with the reply as a JSON body |
+| Any other status (including `404`) | That status, with the reply as a JSON body |
 
 Unlike the header of the same name on the JSON-RPC route, this
 `dwn-response` header holds the bare reply, not a JSON-RPC response. A client
@@ -733,10 +743,10 @@ GET /:did/read/modules/:module/:modulePath
   [Query Records](#query-records).
 
 The server finds the most recently published record that matches, and answers
-as for [Read a Record](#read-a-record). It answers `404` if none matches, `400`
-if the module path is empty, `:module` is not valid base64url, or `filter.*`
-parameters are invalid, and forwards any other intermediate query status with an
-empty body.
+as for [Read a Record](#read-a-record). It answers `404` (empty body) if none
+matches or if the node answers `401`, `400` if the module path is empty,
+`:module` is not valid base64url, or `filter.*` parameters are invalid, and
+forwards any other intermediate query status with an empty body.
 
 ### Read a Module Definition
 
@@ -746,8 +756,8 @@ GET /:did/read/modules/:module
 
 `:module` is the module URI, base64url-encoded. Answers `200` with the module's
 `ModulesConfigure` message as JSON, `400` if `:module` is not valid base64url,
-`404` if the module is not installed or not published, or the node's status with
-an empty body on other failures.
+`404` (empty body) if the module is not installed, not published, or the node
+answers `401`, or the node's status with an empty body on other failures.
 
 ### List Module Definitions
 
@@ -756,7 +766,8 @@ GET /:did/query/modules
 ```
 
 Answers `200` with a JSON array of the `ModulesConfigure` messages of the
-tenant's published modules (or the node's status with an empty body on failure).
+tenant's published modules, `404` (empty body) if the node answers `401`, or
+the node's status with an empty body on other failures.
 
 ### Query Records
 
@@ -1113,7 +1124,9 @@ URL scheme. Opening `dwn://connect?callback=<encoded URL>` makes it redirect
 the browser to
 `<callback>#<base64url of {"endpoint":"http://127.0.0.1:<port>"}>`. The page
 that receives this ****MUST**** accept the endpoint only if its host is
-`127.0.0.1`, `::1`, `localhost`, or a name ending in `.localhost`.
+`127.0.0.1`, `::1`, `localhost`, or a name ending in `.localhost` (note that a
+local node's `Host` check accepts only `localhost`, `::1`, or `127.0.0.0/8`, so
+desktop apps ****SHOULD**** advertise `127.0.0.1`, `::1`, or `localhost`).
 
 ### Local Callers and Synchronization
 
@@ -1154,7 +1167,12 @@ on.
 - **The transport is not trusted.** A node verifies every message it is
   given: its signatures, its CIDs, and its authority. Nothing in this
   specification lets a caller skip that, and a server gains no authority over
-  a tenant's data by carrying it.
+  a tenant's data by carrying it. Likewise, a client that reads directly from a
+  remote server without admitting the messages into a local node ****SHOULD****
+  verify the returned JWS signatures, `initialWrite` immutable-property
+  consistency, filter/module membership (`published: true` on anonymous
+  requests), and `dataCid` / `dataSize` over inline `encodedData` or streamed
+  read bytes before trusting the reply.
 - **Parsing.** The `dwn-response` header carries JSON from a server, and REST
   query parameters carry property paths from a caller. Both are untrusted
   input. A server ****MUST**** ignore query parameters whose path contains
@@ -1212,9 +1230,6 @@ a starting point for other clients.
 
 [RFC 6455 — The WebSocket Protocol](https://datatracker.ietf.org/doc/html/rfc6455)
 ~ I. Fette, A. Melnikov. December 2011.
-
-[RFC 8259 — The JavaScript Object Notation (JSON) Data Interchange Format](https://datatracker.ietf.org/doc/html/rfc8259)
-~ T. Bray. December 2017.
 
 [RFC 9110 — HTTP Semantics](https://datatracker.ietf.org/doc/html/rfc9110)
 ~ R. Fielding, M. Nottingham, J. Reschke. June 2022.
