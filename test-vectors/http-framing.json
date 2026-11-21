@@ -1,0 +1,201 @@
+{
+  "suite": "dwn-transport-spec/http-framing",
+  "spec": "https://dwn-transport-spec.pages.dev#request-framing",
+  "mediaType": "application/vnd.enbox.dwn-rpc",
+  "description": "Binary HTTP request framing vectors (1-byte flags, 4-byte big-endian envelope length, UTF-8 JSON-RPC envelope, optional trailing raw data bytes) and Content-Type matching.",
+  "contentTypes": [
+    {
+      "value": "application/vnd.enbox.dwn-rpc",
+      "expectedValid": true
+    },
+    {
+      "value": "APPLICATION/VND.ENBOX.DWN-RPC",
+      "expectedValid": true
+    },
+    {
+      "value": "  application/vnd.enbox.dwn-rpc  ",
+      "expectedValid": true
+    },
+    {
+      "value": "application/vnd.enbox.dwn-rpc; charset=utf-8",
+      "expectedValid": false
+    },
+    {
+      "value": "application/json",
+      "expectedValid": false
+    }
+  ],
+  "validFrames": [
+    {
+      "id": "frame-no-data-query",
+      "description": "Flags 0x00: JSON-RPC envelope only (no record data stream).",
+      "flagsHex": "00",
+      "envelopeByteLength": 443,
+      "jsonRpcRequest": {
+        "jsonrpc": "2.0",
+        "id": "req-query-1",
+        "method": "dwn.processMessage",
+        "params": {
+          "target": "did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0",
+          "message": {
+            "descriptor": {
+              "interface": "Records",
+              "method": "Query",
+              "messageTimestamp": "2026-06-01T00:00:00.000000Z",
+              "filter": {
+                "module": "https://example.com/modules/notes"
+              }
+            }
+          }
+        }
+      },
+      "dataPresent": false,
+      "frameHex": "00000001bb7b226a736f6e727063223a22322e30222c226964223a227265712d71756572792d31222c226d6574686f64223a2264776e2e70726f636573734d657373616765222c22706172616d73223a7b22746172676574223a226469643a6a776b3a65794a6a636e59694f694a465a4449314e5445354969776961335235496a6f695430745149697769654349364969316e4c5468535a6b685a4d6a5266556b387a6330314d5155464e64466c4e6555785864464a715430745362574a74526d4e74546d5245563030694c434a72615751694f694a4d5333427a4d56703656303951656b7443526e41784f557049575773315a557033565639424f484a6d617a6b334f4442564e4646474d57527a496e30222c226d657373616765223a7b2264657363726970746f72223a7b22696e74657266616365223a225265636f726473222c226d6574686f64223a225175657279222c226d65737361676554696d657374616d70223a22323032362d30362d30315430303a30303a30302e3030303030305a222c2266696c746572223a7b226d6f64756c65223a2268747470733a2f2f6578616d706c652e636f6d2f6d6f64756c65732f6e6f746573227d7d7d7d7d"
+    },
+    {
+      "id": "frame-with-data-write",
+      "description": "Flags 0x01: JSON-RPC envelope followed by 11 raw bytes (\"Hello, DWN!\").",
+      "flagsHex": "01",
+      "envelopeByteLength": 536,
+      "jsonRpcRequest": {
+        "jsonrpc": "2.0",
+        "id": "req-write-1",
+        "method": "dwn.processMessage",
+        "params": {
+          "target": "did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0",
+          "message": {
+            "descriptor": {
+              "interface": "Records",
+              "method": "Write",
+              "module": "https://example.com/modules/notes",
+              "modulePath": "note",
+              "dataFormat": "text/plain",
+              "dataSize": 11,
+              "dateCreated": "2026-06-01T00:00:00.000000Z",
+              "messageTimestamp": "2026-06-01T00:00:00.000000Z"
+            }
+          }
+        }
+      },
+      "dataPresent": true,
+      "dataUtf8": "Hello, DWN!",
+      "dataHex": "48656c6c6f2c2044574e21",
+      "frameHex": "01000002187b226a736f6e727063223a22322e30222c226964223a227265712d77726974652d31222c226d6574686f64223a2264776e2e70726f636573734d657373616765222c22706172616d73223a7b22746172676574223a226469643a6a776b3a65794a6a636e59694f694a465a4449314e5445354969776961335235496a6f695430745149697769654349364969316e4c5468535a6b685a4d6a5266556b387a6330314d5155464e64466c4e6555785864464a715430745362574a74526d4e74546d5245563030694c434a72615751694f694a4d5333427a4d56703656303951656b7443526e41784f557049575773315a557033565639424f484a6d617a6b334f4442564e4646474d57527a496e30222c226d657373616765223a7b2264657363726970746f72223a7b22696e74657266616365223a225265636f726473222c226d6574686f64223a225772697465222c226d6f64756c65223a2268747470733a2f2f6578616d706c652e636f6d2f6d6f64756c65732f6e6f746573222c226d6f64756c6550617468223a226e6f7465222c2264617461466f726d6174223a22746578742f706c61696e222c226461746153697a65223a31312c226461746543726561746564223a22323032362d30362d30315430303a30303a30302e3030303030305a222c226d65737361676554696d657374616d70223a22323032362d30362d30315430303a30303a30302e3030303030305a227d7d7d7d48656c6c6f2c2044574e21"
+    },
+    {
+      "id": "frame-complete-zero-byte-write",
+      "description": "Flags 0x01 with 0 trailing bytes: complete 0-byte RecordsWrite (node answers 202, not 204).",
+      "flagsHex": "01",
+      "envelopeByteLength": 536,
+      "jsonRpcRequest": {
+        "jsonrpc": "2.0",
+        "id": "req-write-1",
+        "method": "dwn.processMessage",
+        "params": {
+          "target": "did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0",
+          "message": {
+            "descriptor": {
+              "interface": "Records",
+              "method": "Write",
+              "module": "https://example.com/modules/notes",
+              "modulePath": "note",
+              "dataFormat": "text/plain",
+              "dataSize": 11,
+              "dateCreated": "2026-06-01T00:00:00.000000Z",
+              "messageTimestamp": "2026-06-01T00:00:00.000000Z"
+            }
+          }
+        }
+      },
+      "dataPresent": true,
+      "dataHex": "",
+      "frameHex": "01000002187b226a736f6e727063223a22322e30222c226964223a227265712d77726974652d31222c226d6574686f64223a2264776e2e70726f636573734d657373616765222c22706172616d73223a7b22746172676574223a226469643a6a776b3a65794a6a636e59694f694a465a4449314e5445354969776961335235496a6f695430745149697769654349364969316e4c5468535a6b685a4d6a5266556b387a6330314d5155464e64466c4e6555785864464a715430745362574a74526d4e74546d5245563030694c434a72615751694f694a4d5333427a4d56703656303951656b7443526e41784f557049575773315a557033565639424f484a6d617a6b334f4442564e4646474d57527a496e30222c226d657373616765223a7b2264657363726970746f72223a7b22696e74657266616365223a225265636f726473222c226d6574686f64223a225772697465222c226d6f64756c65223a2268747470733a2f2f6578616d706c652e636f6d2f6d6f64756c65732f6e6f746573222c226d6f64756c6550617468223a226e6f7465222c2264617461466f726d6174223a22746578742f706c61696e222c226461746153697a65223a31312c226461746543726561746564223a22323032362d30362d30315430303a30303a30302e3030303030305a222c226d65737361676554696d657374616d70223a22323032362d30362d30315430303a30303a30302e3030303030305a227d7d7d7d"
+    },
+    {
+      "id": "frame-dataless-initial-write",
+      "description": "Flags 0x00 with no data stream: dataless initial RecordsWrite (node stores ancestry-only skeleton and answers 204).",
+      "flagsHex": "00",
+      "envelopeByteLength": 536,
+      "jsonRpcRequest": {
+        "jsonrpc": "2.0",
+        "id": "req-write-1",
+        "method": "dwn.processMessage",
+        "params": {
+          "target": "did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0",
+          "message": {
+            "descriptor": {
+              "interface": "Records",
+              "method": "Write",
+              "module": "https://example.com/modules/notes",
+              "modulePath": "note",
+              "dataFormat": "text/plain",
+              "dataSize": 11,
+              "dateCreated": "2026-06-01T00:00:00.000000Z",
+              "messageTimestamp": "2026-06-01T00:00:00.000000Z"
+            }
+          }
+        }
+      },
+      "dataPresent": false,
+      "frameHex": "00000002187b226a736f6e727063223a22322e30222c226964223a227265712d77726974652d31222c226d6574686f64223a2264776e2e70726f636573734d657373616765222c22706172616d73223a7b22746172676574223a226469643a6a776b3a65794a6a636e59694f694a465a4449314e5445354969776961335235496a6f695430745149697769654349364969316e4c5468535a6b685a4d6a5266556b387a6330314d5155464e64466c4e6555785864464a715430745362574a74526d4e74546d5245563030694c434a72615751694f694a4d5333427a4d56703656303951656b7443526e41784f557049575773315a557033565639424f484a6d617a6b334f4442564e4646474d57527a496e30222c226d657373616765223a7b2264657363726970746f72223a7b22696e74657266616365223a225265636f726473222c226d6574686f64223a225772697465222c226d6f64756c65223a2268747470733a2f2f6578616d706c652e636f6d2f6d6f64756c65732f6e6f746573222c226d6f64756c6550617468223a226e6f7465222c2264617461466f726d6174223a22746578742f706c61696e222c226461746153697a65223a31312c226461746543726561746564223a22323032362d30362d30315430303a30303a30302e3030303030305a222c226d65737361676554696d657374616d70223a22323032362d30362d30315430303a30303a30302e3030303030305a227d7d7d7d"
+    }
+  ],
+  "invalidFrames": [
+    {
+      "id": "invalid-flags-0x02",
+      "description": "Unsupported flags byte 0x02 (only 0x00 and 0x01 allowed).",
+      "frameHex": "02000000027b7d",
+      "expectedHttpStatus": 400,
+      "expectedJsonRpcErrorCode": -50400
+    },
+    {
+      "id": "invalid-envelope-length-zero",
+      "description": "Envelope length 0 is invalid.",
+      "frameHex": "0000000000",
+      "expectedHttpStatus": 400,
+      "expectedJsonRpcErrorCode": -50400
+    },
+    {
+      "id": "invalid-envelope-exceeds-1mib",
+      "description": "Envelope length 1,048,577 (0x00100001) exceeds 1 MiB limit.",
+      "frameHex": "00001000017b7d",
+      "expectedHttpStatus": 400,
+      "expectedJsonRpcErrorCode": -50400
+    },
+    {
+      "id": "invalid-truncated-header",
+      "description": "Body shorter than 5-byte frame header.",
+      "frameHex": "000000",
+      "expectedHttpStatus": 400,
+      "expectedJsonRpcErrorCode": -50400
+    },
+    {
+      "id": "invalid-truncated-envelope",
+      "description": "Body ends before declared envelope length.",
+      "frameHex": "000000000a7b7d",
+      "expectedHttpStatus": 400,
+      "expectedJsonRpcErrorCode": -50400
+    },
+    {
+      "id": "invalid-trailing-bytes-with-flag-0x00",
+      "description": "Extra bytes after envelope when flags is 0x00.",
+      "frameHex": "00000000027b7dff",
+      "expectedHttpStatus": 400,
+      "expectedJsonRpcErrorCode": -50400
+    },
+    {
+      "id": "invalid-non-utf8-envelope",
+      "description": "Envelope contains invalid UTF-8 bytes (0xff 0xfe).",
+      "frameHex": "0000000002fffe",
+      "expectedHttpStatus": 400,
+      "expectedJsonRpcErrorCode": -50400
+    },
+    {
+      "id": "invalid-json-envelope",
+      "description": "Envelope is valid UTF-8 (\"{bad\") but not valid JSON.",
+      "frameHex": "00000000047b626164",
+      "expectedHttpStatus": 400,
+      "expectedJsonRpcErrorCode": -50400
+    }
+  ]
+}

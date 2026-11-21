@@ -1358,6 +1358,12 @@ a starting point for other clients.
   `MessagesRead` requests, `RecordsWrite` messages sent with
   `dwn.processMessage`, and streamed payloads always use HTTP.
 
+## Conformance Test Vectors
+
+Deterministic JSON test vectors for HTTP binary request framing
+(`application/vnd.enbox.dwn-rpc`) and Proof-of-Work registration hashes live in
+[`test-vectors/`](https://github.com/enboxorg/dwn-transport-spec/tree/main/test-vectors).
+
 ## References
 
 [DWN Specification](https://dwn-spec.pages.dev)

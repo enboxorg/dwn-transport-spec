@@ -1,0 +1,55 @@
+{
+  "suite": "dwn-transport-spec/proof-of-work",
+  "spec": "https://dwn-transport-spec.pages.dev#proof-of-work",
+  "description": "Tenant registration Proof-of-Work hash preimage concatenation (UTF-8 text: challengeNonce || responseNonce || compact registrationData JSON) and threshold verification.",
+  "termsOfService": {
+    "text": "Enbox DWN Terms of Service v1",
+    "expectedSha256Hex": "722586e8c3ed9581b9446e1bbf8a21d7991fd18ec93889dab47957271422ac1b"
+  },
+  "vectors": [
+    {
+      "id": "pow-valid-with-tos",
+      "description": "Valid PoW solution with termsOfServiceHash; computed SHA-256 <= maximumAllowedHashValue.",
+      "challengeNonce": "4C8F1A2B9D0E3F4A5B6C7D8E9F0A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A",
+      "maximumAllowedHashValue": "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "registrationData": {
+        "did": "did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0",
+        "termsOfServiceHash": "722586e8c3ed9581b9446e1bbf8a21d7991fd18ec93889dab47957271422ac1b"
+      },
+      "compactRegistrationDataJson": "{\"did\":\"did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0\",\"termsOfServiceHash\":\"722586e8c3ed9581b9446e1bbf8a21d7991fd18ec93889dab47957271422ac1b\"}",
+      "responseNonce": "000000000000000000000000000000000000000000000000000000000000019D",
+      "preimageUtf8": "4C8F1A2B9D0E3F4A5B6C7D8E9F0A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A000000000000000000000000000000000000000000000000000000000000019D{\"did\":\"did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0\",\"termsOfServiceHash\":\"722586e8c3ed9581b9446e1bbf8a21d7991fd18ec93889dab47957271422ac1b\"}",
+      "expectedSha256Hex": "00fc35d790ab5a66dc92c5c0a27e171f475a2fe421118b0f48c8a2f30e5793d0",
+      "expectedValid": true
+    },
+    {
+      "id": "pow-insufficient-with-tos",
+      "description": "Insufficient PoW nonce; computed SHA-256 > maximumAllowedHashValue.",
+      "challengeNonce": "4C8F1A2B9D0E3F4A5B6C7D8E9F0A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A",
+      "maximumAllowedHashValue": "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "registrationData": {
+        "did": "did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0",
+        "termsOfServiceHash": "722586e8c3ed9581b9446e1bbf8a21d7991fd18ec93889dab47957271422ac1b"
+      },
+      "compactRegistrationDataJson": "{\"did\":\"did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0\",\"termsOfServiceHash\":\"722586e8c3ed9581b9446e1bbf8a21d7991fd18ec93889dab47957271422ac1b\"}",
+      "responseNonce": "0000000000000000000000000000000000000000000000000000000000000000",
+      "preimageUtf8": "4C8F1A2B9D0E3F4A5B6C7D8E9F0A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A0000000000000000000000000000000000000000000000000000000000000000{\"did\":\"did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0\",\"termsOfServiceHash\":\"722586e8c3ed9581b9446e1bbf8a21d7991fd18ec93889dab47957271422ac1b\"}",
+      "expectedSha256Hex": "564ac9be28935fabd979f7dca68fdfc61db063f77a65d1b817b38d8b3b4c7910",
+      "expectedValid": false
+    },
+    {
+      "id": "pow-valid-without-tos",
+      "description": "Valid PoW solution when server does not require terms-of-service.",
+      "challengeNonce": "4C8F1A2B9D0E3F4A5B6C7D8E9F0A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A",
+      "maximumAllowedHashValue": "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "registrationData": {
+        "did": "did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0"
+      },
+      "compactRegistrationDataJson": "{\"did\":\"did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0\"}",
+      "responseNonce": "0000000000000000000000000000000000000000000000000000000000000043",
+      "preimageUtf8": "4C8F1A2B9D0E3F4A5B6C7D8E9F0A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A0000000000000000000000000000000000000000000000000000000000000043{\"did\":\"did:jwk:eyJjcnYiOiJFZDI1NTE5Iiwia3R5IjoiT0tQIiwieCI6Ii1nLThSZkhZMjRfUk8zc01MQUFNdFlNeUxXdFJqT0tSbWJtRmNtTmREV00iLCJraWQiOiJMS3BzMVp6V09QektCRnAxOUpIWWs1ZUp3VV9BOHJmazk3ODBVNFFGMWRzIn0\"}",
+      "expectedSha256Hex": "00f5f9b15fce9f4e3782c9dd041d15037ba7e3233432d63c44c7f53489594bab",
+      "expectedValid": true
+    }
+  ]
+}

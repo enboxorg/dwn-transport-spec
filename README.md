@@ -4,6 +4,10 @@
 
 Latest Draft: https://dwn-transport-spec.pages.dev
 
+### Conformance Artifacts
+
+- **Conformance Test Vectors:** [`test-vectors/`](./test-vectors/)
+
 ### Companion Specifications
 
 - **Decentralized Web Node (Core)**: https://dwn-spec.pages.dev (`enboxorg/dwn-spec`)
